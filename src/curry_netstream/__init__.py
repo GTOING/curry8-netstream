@@ -8,7 +8,7 @@
 """
 from .client import CurryClient
 from .models import DataBlock, Event, SessionInfo
-from .protocol import FrameHeader, MessageCode
+from .protocol import FrameHeader, encode_control
 
 __all__ = [
     "CurryClient",
@@ -16,5 +16,5 @@ __all__ = [
     "Event",
     "SessionInfo",
     "FrameHeader",
-    "MessageCode",
+    "encode_control",
 ]

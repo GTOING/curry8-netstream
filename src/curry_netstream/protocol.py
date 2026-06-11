@@ -1,108 +1,89 @@
 """Curry 8 NetStreaming 协议层 —— 整套代码里【唯一的"校准点"】。
 
-⚠️ 重要前提
-    raw float 数据包的精确字节布局，在 CURRY 8 User Guide 中并没有给出。
-    手册 p.254 / p.256 明确写道：协议规范与可运行的 C++ / MATLAB demo 需要向
-    curry8help@neuroscan.com 索取。因此——
+✅ 帧头结构：已用真实抓包 capture.bin 校准（不再是纯假设）。
+   实际收到的字节（连接后服务器发来的两条控制消息）：
 
-      * 本文件中的帧头结构(HEADER_FORMAT)、字段顺序、消息码(MessageCode)取值
-        全部是【基于公开实现的合理假设 / PLACEHOLDER】。
-      * 拿到官方 demo 后，通常【只需修改本文件】即可让 client.py 正常工作，
-        其余模块无需改动。
+       43 54 52 4c 00 01 00 02 00 00 00 00 00 00 00 00 00 00 00 00
+        C  T  R  L  ^code  ^req  ^^^^^^^^ sample/size1/size2 全 0 ^^^^^^
 
-参考：User Guide p.253-257《14.2.1.1 Configure as NetStreaming Server or Client》。
-每个数据块由 Curry(Server) 发出，含以下内容（手册原文变量名）：
-    indat            波形数据       -> DataBlock.data
-    inlabels         通道标签列表   -> 经 INFO 消息获取 -> SessionInfo.labels
-    insampleratehz   采样率(Hz)     -> 经 INFO 消息获取 -> SessionInfo.sample_rate_hz
-    instartsample    绝对起始采样   -> FrameHeader.sample
-    inevents         块内事件       -> DATA payload 尾部（本骨架暂留空，待校准）
+   => 帧头 = 20 字节、**大端 (network byte order)**，布局如下：
+        char     id[4]    # 4 字节 ASCII 块标识，已确认有 "CTRL"
+        uint16   code     # 消息码
+        uint16   request  # 请求/子码
+        uint32   sample   # 起始采样点 / 块号 (instartsample)
+        uint32   size1    # 紧随其后的 payload 字节数（未压缩）
+        uint32   size2    # 压缩大小 / 预留
+
+⚠️ 仍待确认（需要看到真实 DATA 块才能定）：
+   - DATA / INFO 块用的 id 是什么（目前只观察到 "CTRL"）
+   - payload 里 float 样本的字节序（大端还是小端）、是否内嵌事件
+   - 各 code / request 的语义、以及"请求开始推流"该发什么
+   抓到一帧 DATA 后，基本只改本文件即可。
+
+参考：CURRY 8 User Guide p.253-257《14.2.1.1 Configure as NetStreaming Server or Client》。
 """
 from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from enum import IntEnum
 
-# --- 帧头格式（PLACEHOLDER，待官方 demo 校准）--------------------------------
-# 假设布局：小端(little-endian)；8 字节标识 + 6 个 uint32。
-#   device_id[8] : 设备/块标识（ASCII，右侧补 \x00）
-#   code         : 消息码，见 MessageCode
-#   request      : 请求号 / 序号
-#   sample       : 绝对起始采样点 (对应 instartsample)
-#   n_items      : 数据项数（DATA 时=通道数×采样数；其它消息含义不同）
-#   data_size    : 紧随帧头之后的 payload 字节数
-#   reserved     : 预留字段
-HEADER_FORMAT = "<8sIIIIII"
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # = 8 + 6*4 = 32 字节
+# --- 帧头格式（已用 capture.bin 校准）---------------------------------------
+# 大端；4 字节 ASCII id + uint16 code + uint16 request + 3 × uint32
+HEADER_FORMAT = ">4sHHIII"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # = 20 字节
 
-# 假设：非压缩 raw float = 小端 float32。压缩格式(Compressed)不在骨架范围内。
-SAMPLE_DTYPE = "<f4"
+# 已知/推测的 4 字节块标识 (id) ------------------------------------------------
+ID_CTRL = b"CTRL"   # ✅ 已抓包确认：控制 / 状态 / 握手消息
+# 下面两个是推测，等抓到真实 DATA 块时按日志里出现的真实 id 修正：
+ID_DATA = b"DATA"   # ❓ 推测：EEG 数据块
+ID_INFO = b"INFO"   # ❓ 推测：会话信息（采样率/通道）
 
-
-class MessageCode(IntEnum):
-    """消息码（PLACEHOLDER，待官方 demo 校准）。"""
-
-    # ---- Server -> Client ----
-    INFO = 1        # 会话信息：采样率 / 通道数 / 通道标签
-    DATA = 2        # 一块波形数据(+事件)
-    IMPEDANCE = 3   # 阻抗结果
-
-    # ---- Client -> Server（控制流）----
-    # 对应手册 "Allow Client to control amplifier" / "start/pause recording"
-    CTRL_START_RECORDING = 101
-    CTRL_STOP_RECORDING = 102
-    CTRL_START_ACQUISITION = 103
-    CTRL_STOP_ACQUISITION = 104
-    CTRL_START_IMPEDANCE = 105
+# payload 里 raw float 的字节序（❓待 DATA 抓包确认；EEG 数值是否合理可反推）
+SAMPLE_DTYPE = "<f4"  # 先按小端 float32；若解出来是垃圾值就改成 ">f4"
 
 
 @dataclass(slots=True)
 class FrameHeader:
-    """一个 NetStreaming 帧的固定长度头部。"""
+    """一个 NetStreaming 帧的固定 20 字节头部（大端）。"""
 
-    device_id: bytes
-    code: int
-    request: int
-    sample: int
-    n_items: int
-    data_size: int
-    reserved: int = 0
+    chid: bytes      # 4 字节块标识，如 b"CTRL"
+    code: int        # uint16
+    request: int     # uint16
+    sample: int      # uint32：起始采样 / 块号
+    size1: int       # uint32：payload 字节数（未压缩）
+    size2: int       # uint32：压缩大小 / 预留
+
+    @property
+    def data_size(self) -> int:
+        """紧随帧头之后应读取的 payload 字节数。"""
+        # 非压缩格式下用 size1；压缩格式(本骨架暂不处理)再议。
+        return self.size1
 
     def pack(self) -> bytes:
-        """序列化为 HEADER_SIZE 字节。"""
         return struct.pack(
             HEADER_FORMAT,
-            self.device_id[:8].ljust(8, b"\x00"),
-            self.code,
-            self.request,
+            self.chid[:4].ljust(4, b"\x00"),
+            self.code & 0xFFFF,
+            self.request & 0xFFFF,
             self.sample,
-            self.n_items,
-            self.data_size,
-            self.reserved,
+            self.size1,
+            self.size2,
         )
 
     @classmethod
     def unpack(cls, raw: bytes) -> "FrameHeader":
-        """从 HEADER_SIZE 字节反序列化。长度不符会抛 ValueError。"""
         if len(raw) != HEADER_SIZE:
             raise ValueError(f"帧头长度应为 {HEADER_SIZE}，实际 {len(raw)}")
-        dev, code, req, sample, n_items, data_size, reserved = struct.unpack(
-            HEADER_FORMAT, raw
-        )
-        return cls(dev, code, req, sample, n_items, data_size, reserved)
+        chid, code, request, sample, size1, size2 = struct.unpack(HEADER_FORMAT, raw)
+        return cls(chid, code, request, sample, size1, size2)
 
 
-def encode_control(code: MessageCode, request: int = 0) -> bytes:
-    """编码一条「客户端 -> 服务器」的控制指令（仅帧头、无 payload）。
+def encode_control(code: int, request: int = 0, chid: bytes = ID_CTRL) -> bytes:
+    """编码一条「客户端 -> 服务器」的控制消息（仅 20 字节帧头、无 payload）。
 
-    用于 start/stop recording、impedance 等远程控制。
+    ⚠️ code / request 的具体取值仍待确认（需 Neuroscan demo 或试验）。
+    本函数只保证按真实的 20 字节大端结构打包；语义留待校准。
     """
     return FrameHeader(
-        device_id=b"CTRL",
-        code=int(code),
-        request=request,
-        sample=0,
-        n_items=0,
-        data_size=0,
+        chid=chid, code=code, request=request, sample=0, size1=0, size2=0
     ).pack()

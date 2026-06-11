@@ -20,9 +20,10 @@ from .logging_util import hexdump
 from .models import DataBlock, SessionInfo
 from .protocol import (
     HEADER_SIZE,
+    ID_CTRL,
+    ID_INFO,
     SAMPLE_DTYPE,
     FrameHeader,
-    MessageCode,
     encode_control,
 )
 
@@ -167,9 +168,9 @@ class CurryClient:
         raw_header = self._recv_exact(HEADER_SIZE)
         header = FrameHeader.unpack(raw_header)
         log.debug(
-            "帧头 code=%s sample=%d n_items=%d data_size=%d | %s",
-            header.code, header.sample, header.n_items, header.data_size,
-            hexdump(raw_header),
+            "帧头 id=%r code=%d request=%d sample=%d data_size=%d | %s",
+            header.chid.rstrip(b"\x00"), header.code, header.request,
+            header.sample, header.data_size, hexdump(raw_header),
         )
         payload = self._recv_exact(header.data_size) if header.data_size else b""
         if payload:
@@ -195,7 +196,7 @@ class CurryClient:
         except Exception:  # noqa: BLE001 —— 协议未校准时容错
             log.debug("INFO payload 无法按假设格式解析，按空会话处理")
         self._session = SessionInfo(
-            n_channels=len(labels) or header.n_items,
+            n_channels=len(labels),
             sample_rate_hz=sr,
             labels=labels,
         )
@@ -248,47 +249,72 @@ class CurryClient:
                 log.error("连接中断: %s", exc)
                 break
 
-            code = header.code
-            if code == MessageCode.INFO:
+            cid = header.chid.rstrip(b"\x00")
+            if cid == ID_CTRL:
+                # 控制/状态/握手消息（已抓包确认的类型，通常无 payload）
+                log.info(
+                    "CTRL 控制消息: code=%d request=%d (payload %dB)",
+                    header.code, header.request, len(payload),
+                )
+            elif cid == ID_INFO:
                 self._handle_info(header, payload)
-            elif code == MessageCode.DATA:
+            elif payload:
+                # 带 payload 的非控制帧：先当数据块试解。
+                # 注意把真实 id 打出来，以便确认 DATA 块到底用什么标识。
+                log.info("数据帧 id=%r（%d 字节 payload）", cid, len(payload))
                 on_data(self._handle_data(header, payload))
                 n += 1
                 if max_blocks is not None and n >= max_blocks:
                     log.info("已达 max_blocks=%d，停止接收。", max_blocks)
                     break
-            elif code == MessageCode.IMPEDANCE:
-                log.info("收到阻抗结果帧 (n_items=%d)", header.n_items)
             else:
                 log.warning(
-                    "未知消息码 %d（payload %dB）—— 协议可能尚未校准",
-                    code, len(payload),
+                    "未知帧 id=%r code=%d request=%d（无 payload）—— 待校准",
+                    cid, header.code, header.request,
                 )
 
     # ------------------------------------------------------------------ #
     # 控制流（客户端 -> 服务器）
+    #
+    # ⚠️ 控制码 (code/request) 尚未确认：手册要求向 Neuroscan 索取 demo 才有
+    #    规范。下面的取值是【占位/试验用】，仅保证按真实的 20 字节大端结构发送。
+    #    抓到一次"发了 X 之后服务器开始推流"的成功样本后，再把这些码改对。
     # ------------------------------------------------------------------ #
+    # (code, request) —— 占位值，待校准
+    _CTRL_TBD = {
+        "start_acquisition": (1, 10),
+        "stop_acquisition": (1, 11),
+        "start_recording": (1, 20),
+        "stop_recording": (1, 21),
+        "start_impedance": (1, 30),
+    }
+
     def _send(self, data: bytes) -> None:
         if self._sock is None:
             raise ConnectionError("未连接")
         self._sock.sendall(data)
 
+    def send_control(self, code: int, request: int = 0) -> None:
+        """发送任意控制码（用于试验/逆向）。"""
+        log.info("-> 发送控制: code=%d request=%d", code, request)
+        self._send(encode_control(code, request))
+
+    def _send_named(self, name: str) -> None:
+        code, request = self._CTRL_TBD[name]
+        log.info("-> 发送 %s （控制码待确认: code=%d request=%d）", name, code, request)
+        self._send(encode_control(code, request))
+
     def start_recording(self) -> None:
-        log.info("-> 发送 开始录制")
-        self._send(encode_control(MessageCode.CTRL_START_RECORDING))
+        self._send_named("start_recording")
 
     def stop_recording(self) -> None:
-        log.info("-> 发送 停止录制")
-        self._send(encode_control(MessageCode.CTRL_STOP_RECORDING))
+        self._send_named("stop_recording")
 
     def start_acquisition(self) -> None:
-        log.info("-> 发送 开始采集")
-        self._send(encode_control(MessageCode.CTRL_START_ACQUISITION))
+        self._send_named("start_acquisition")
 
     def stop_acquisition(self) -> None:
-        log.info("-> 发送 停止采集")
-        self._send(encode_control(MessageCode.CTRL_STOP_ACQUISITION))
+        self._send_named("stop_acquisition")
 
     def start_impedance(self) -> None:
-        log.info("-> 发送 阻抗检测")
-        self._send(encode_control(MessageCode.CTRL_START_IMPEDANCE))
+        self._send_named("start_impedance")

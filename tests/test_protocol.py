@@ -1,7 +1,7 @@
-"""协议层单元测试 —— 用构造字节验证解析逻辑，无需任何服务器或硬件。
+"""协议层单元测试 —— 含【真实抓包】回归用例，无需任何服务器或硬件。
 
-这是『只做客户端』时的主要调试入口：可在此打断点，逐步检查
-帧头打包/解包、控制指令编码、float32 payload 整形等逻辑。
+这是调试入口：可在此打断点，逐步检查 20 字节大端帧头的打包/解包、
+控制消息编码、float32 payload 整形等逻辑。
 """
 from __future__ import annotations
 
@@ -13,47 +13,60 @@ import pytest
 from curry_netstream.protocol import (
     HEADER_FORMAT,
     HEADER_SIZE,
+    ID_CTRL,
     SAMPLE_DTYPE,
     FrameHeader,
-    MessageCode,
     encode_control,
 )
 
+# 来自真实抓包 capture.bin：连接 Curry NetStreaming Server 后收到的第一条消息
+REAL_CTRL_MSG_1 = bytes.fromhex("4354524c00010002000000000000000000000000")
+REAL_CTRL_MSG_2 = bytes.fromhex("4354524c00010001000000000000000000000000")
 
-def test_header_size_constant() -> None:
+
+def test_header_size_is_20() -> None:
     assert HEADER_SIZE == struct.calcsize(HEADER_FORMAT)
-    assert HEADER_SIZE == 32
+    assert HEADER_SIZE == 20
+
+
+def test_decode_real_capture() -> None:
+    """用真实字节验证帧头解析（回归用例）。"""
+    h1 = FrameHeader.unpack(REAL_CTRL_MSG_1)
+    assert h1.chid == ID_CTRL  # b"CTRL"
+    assert h1.code == 1
+    assert h1.request == 2
+    assert h1.sample == 0
+    assert h1.data_size == 0  # 纯控制消息，无 payload
+
+    h2 = FrameHeader.unpack(REAL_CTRL_MSG_2)
+    assert h2.chid == ID_CTRL
+    assert h2.code == 1
+    assert h2.request == 1
+    assert h2.data_size == 0
 
 
 def test_header_roundtrip() -> None:
     h = FrameHeader(
-        device_id=b"DEV",
-        code=int(MessageCode.DATA),
-        request=7,
-        sample=1000,
-        n_items=64,
-        data_size=256,
-        reserved=0,
+        chid=b"DATA", code=2, request=0, sample=1000, size1=256, size2=0
     )
     raw = h.pack()
     assert len(raw) == HEADER_SIZE
 
     back = FrameHeader.unpack(raw)
-    assert back.code == int(MessageCode.DATA)
-    assert back.request == 7
+    assert back.chid == b"DATA"
+    assert back.code == 2
     assert back.sample == 1000
-    assert back.n_items == 64
     assert back.data_size == 256
-    assert back.device_id.rstrip(b"\x00") == b"DEV"
 
 
 def test_encode_control_is_header_only() -> None:
-    raw = encode_control(MessageCode.CTRL_STOP_RECORDING, request=3)
+    raw = encode_control(code=1, request=20)
     assert len(raw) == HEADER_SIZE
 
     h = FrameHeader.unpack(raw)
-    assert h.code == int(MessageCode.CTRL_STOP_RECORDING)
-    assert h.request == 3
+    assert h.chid == ID_CTRL
+    assert h.code == 1
+    assert h.request == 20
     assert h.data_size == 0
 
 
