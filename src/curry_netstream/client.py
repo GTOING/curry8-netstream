@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import time
 from typing import BinaryIO, Callable, Optional
 
 import numpy as np
@@ -89,6 +90,60 @@ class CurryClient:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    # ------------------------------------------------------------------ #
+    # 诊断：纯原始字节窥探（不分帧）
+    # ------------------------------------------------------------------ #
+    def peek_raw(
+        self,
+        duration: float = 10.0,
+        *,
+        chunk: int = 4096,
+        send_start: bool = False,
+    ) -> int:
+        """连接后只读原始字节、不做任何分帧，持续 duration 秒。
+
+        用来回答最关键的问题：**服务器到底有没有在发数据？**
+          - 全程 0 字节   -> 服务器静默：采集没跑，或需要客户端先握手/请求
+          - 收到了字节     -> 有数据流，问题在我们的分帧/解析假设
+        返回累计收到的字节数。
+
+        send_start=True 时，会在被动监听一半时长后，主动发送
+        『开始采集 + 开始录制』控制指令，再继续监听 —— 用来一次验证
+        『是否需要客户端触发』这个假设（日志会清楚标出两个阶段）。
+        """
+        if self._sock is None:
+            raise ConnectionError("未连接")
+        self._sock.settimeout(1.0)
+        deadline = time.monotonic() + duration
+        half = time.monotonic() + duration / 2
+        total = 0
+        sent = False
+        log.info("=== peek 阶段 A：被动监听（不发任何东西）===")
+        while time.monotonic() < deadline:
+            if send_start and not sent and time.monotonic() >= half:
+                log.info("=== peek 阶段 B：发送 开始采集 + 开始录制，再继续监听 ===")
+                try:
+                    self.start_acquisition()
+                    self.start_recording()
+                except OSError as exc:
+                    log.error("发送控制指令失败: %s", exc)
+                sent = True
+            try:
+                data = self._sock.recv(chunk)
+            except (socket.timeout, TimeoutError):
+                log.info("…等待中，累计收到 %d 字节（这 1 秒没有新数据）", total)
+                continue
+            if not data:
+                log.warning("服务器主动关闭了连接（共收到 %d 字节）", total)
+                break
+            total += len(data)
+            if self._dump is not None:
+                self._dump.write(data)
+            log.info("收到 %d 字节（累计 %d）: %s", len(data), total, hexdump(data))
+        verdict = "服务器静默（0 字节）" if total == 0 else f"有数据流（{total} 字节）"
+        log.info("peek 结束：%.1f 秒内 -> %s", duration, verdict)
+        return total
 
     # ------------------------------------------------------------------ #
     # 底层收包

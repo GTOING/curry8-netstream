@@ -34,6 +34,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dump", metavar="PATH", help="把原始字节流写入文件（逆向协议用）")
     p.add_argument("--max-blocks", type=int, default=None, help="收到 N 块后停止")
     p.add_argument(
+        "--peek", type=float, metavar="SECONDS",
+        help="【诊断模式】连接后只 hexdump 原始字节、不分帧，持续 N 秒，"
+             "用来判断服务器是否在发数据",
+    )
+    p.add_argument(
+        "--peek-send-start", action="store_true",
+        help="配合 --peek：监听过半后主动发『开始采集+开始录制』再继续监听",
+    )
+    p.add_argument(
         "--send-impedance", action="store_true",
         help="连接后立即发送一次阻抗检测指令（演示控制流）",
     )
@@ -67,6 +76,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with CurryClient(args.host, args.port, dump_path=args.dump) as client:
             state["client"] = client
+            if args.peek is not None:
+                # 诊断模式：只看原始字节，不进入正常分帧/解析
+                client.peek_raw(args.peek, send_start=args.peek_send_start)
+                return 0
             if args.send_impedance:
                 client.start_impedance()
             client.stream(on_data, max_blocks=args.max_blocks)
