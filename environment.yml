@@ -1,0 +1,10 @@
+# 复现环境用。本项目实际用的是【项目内 prefix 环境】：
+#   conda create -p ./.conda python=3.11 numpy pytest
+# 若想用具名环境，可执行：  conda env create -f environment.yml
+name: curry8
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pytest
