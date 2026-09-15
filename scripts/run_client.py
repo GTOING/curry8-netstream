@@ -34,13 +34,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dump", metavar="PATH", help="把原始字节流写入文件（逆向协议用）")
     p.add_argument("--max-blocks", type=int, default=None, help="收到 N 块后停止")
     p.add_argument(
+        "--expected-seconds", type=float, default=30.0,
+        help="每个 EEG 包预期包含的秒数（默认 30；设为 0 则不检查）",
+    )
+    p.add_argument(
         "--peek", type=float, metavar="SECONDS",
         help="【诊断模式】连接后只 hexdump 原始字节、不分帧，持续 N 秒，"
              "用来判断服务器是否在发数据",
     )
     p.add_argument(
         "--peek-send-start", action="store_true",
-        help="配合 --peek：监听过半后主动发『开始采集+开始录制』再继续监听",
+        help="配合 --peek：监听过半后主动发『开始推流』再继续监听",
     )
     p.add_argument(
         "--send-impedance", action="store_true",
@@ -62,10 +66,23 @@ def main(argv: list[str] | None = None) -> int:
     def on_data(block: DataBlock) -> None:
         state["n"] += 1
         ev = f", events={len(block.events)}" if block.events else ""
+        duration = (
+            block.n_samples / block.sample_rate_hz
+            if block.sample_rate_hz > 0 else 0.0
+        )
         print(
             f"[block {state['n']:>4}] start_sample={block.start_sample} "
-            f"shape={tuple(block.data.shape)} sr={block.sample_rate_hz:.0f}Hz{ev}"
+            f"shape={tuple(block.data.shape)} sr={block.sample_rate_hz:.0f}Hz "
+            f"duration={duration:.3f}s{ev}"
         )
+        if args.expected_seconds > 0:
+            expected = round(block.sample_rate_hz * args.expected_seconds)
+            if block.n_samples != expected:
+                print(
+                    f"警告：该包有 {block.n_samples} 个采样/通道，"
+                    f"预期 {expected}（{args.expected_seconds:g} 秒）。",
+                    file=sys.stderr,
+                )
         if (
             args.stop_after is not None
             and state["n"] == args.stop_after
@@ -90,6 +107,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    except (OSError, ValueError) as exc:
+        print(f"Curry 数据接收失败：{exc}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("\n用户中断。")
 

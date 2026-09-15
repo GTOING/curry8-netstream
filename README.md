@@ -1,114 +1,110 @@
-# Curry 8 NetStreaming —— Python 调试客户端骨架
+# Curry 8 NetStreaming EEG 客户端
 
-用外部 Python 程序，通过 Curry 8 的 **NetStreaming (TCP/IP)** 接口：
-1. 获取实时 EEG 数据流；
-2. 发送远程控制指令（开始/停止录制、阻抗检测）。
+通过 Curry 8 的 NetStreaming TCP/IP 接口完成自动握手，并把每个未压缩
+EEG 数据包解码为 NumPy 数组：
 
-> 本仓库是**可调试的骨架**，重点在清晰的模块边界与可单测的协议层，
-> 而非一个开箱即连真机的成品。
+```text
+shape = [EEG 通道数, 每通道采样点数]
+```
 
----
+如果 Curry 每 30 秒发送一个数据包，采样率为 `fs`，则正常输出应满足：
 
-## ⚠️ 最重要的前提：精确协议待校准
+```text
+每通道采样点数 = fs × 30
+```
 
-`raw float` 数据包的**精确字节布局，CURRY 8 User Guide 里没有给**。
-手册 p.254 / p.256 明确要求向 **curry8help@neuroscan.com** 索取
-可运行的 **C++ / MATLAB demo**（内含协议规范）。
+## 协议依据与当前边界
 
-因此 [`src/curry_netstream/protocol.py`](src/curry_netstream/protocol.py) 里的
-帧头结构、字段顺序、消息码全部是**合理假设 (PLACEHOLDER)**。
-拿到官方 demo 后，**通常只需改这一个文件**，其余模块无需改动。
+协议实现已根据本地 `reference/` 中的 Curry Python 参考客户端完成。该目录
+只用于本机分析，已由 `.gitignore` 排除，不会提交。
 
----
+当前已经明确并实现：
+
+- 20 字节大端消息头：`>4sHHIII`；
+- `CTRL` 与 `DATA` 消息；
+- 基础信息、通道信息、开始/停止推流的请求码；
+- 24 字节小端 `BasicInfoAcq`；
+- 144 字节小端 `NetStreamingChannelInfo`；
+- 未压缩、小端 `float32` EEG；
+- 线上数据为采样点优先交织，输出转为 `[channel, sample]`；
+- TCP 半包跨超时保留，以及最大 payload 长度检查。
+
+仓库尚缺一份真实 Curry EEG 网络抓包，因此解码已经通过合成端到端测试，
+但仍需连接目标 Curry 8 做最终真机验证。压缩的 float32 ZIP 数据暂不支持；
+请将服务器配置为未压缩格式。
+
+## 自动握手流程
+
+正常 `stream()` 会依次执行：
+
+```text
+连接 Curry
+  → 请求 BasicInfo（request=6）
+  → 解析 EEG 通道数、采样率和数据大小
+  → 请求 ChannelInfo（request=3）
+  → 解析 UTF-16LE 通道名称
+  → 请求开始推流（request=8）
+  → 接收 DATA_Eeg / Float32（code=2, request=1）
+  → 输出 DataBlock.data[channel, sample]
+  → 结束时请求停止推流（request=9）
+```
 
 ## 环境
 
-项目内已创建 conda **prefix 环境**：`./.conda`（Python 3.11 + numpy + pytest）。
+依赖 Python 3.11+ 和 NumPy。可以用 Conda 创建环境：
 
-```bash
-# 重新创建（如需要）
-conda create -p ./.conda python=3.11 numpy pytest
-# 或用具名环境
-conda env create -f environment.yml      # 名为 curry8
-
-# 直接用 prefix 环境里的解释器
-./.conda/bin/python --version
+```powershell
+conda env create -f environment.yml
+conda activate curry8
 ```
 
-VS Code：打开本文件夹后，Python 解释器选 `./.conda/bin/python`，
-按 F5 即可用 `.vscode/launch.json` 里的两个配置断点调试。
+## 测试
 
----
+测试只依赖标准库 `unittest` 和 NumPy，不需要 Curry 硬件：
 
-## 目录结构
-
-```
-src/curry_netstream/
-  protocol.py     ★唯一校准点：帧头 / 消息码 / encode·decode
-  models.py       DataBlock / Event / SessionInfo（对应 indat/inlabels/...）
-  client.py       CurryClient：TCP 连接、收包重组、分发、发控制指令
-  logging_util.py 日志 + hexdump
-scripts/
-  run_client.py   CLI 入口
-tests/
-  test_protocol.py 用构造字节测协议层（无需硬件即可调试）
+```powershell
+$env:PYTHONPATH = "src"
+python -m unittest discover -s tests -v
 ```
 
-数据模型与手册变量名的对应（User Guide p.253）：
+测试覆盖真实 CTRL 抓包回归、协议结构尺寸、基础/通道信息、交织 EEG 解码、
+自动握手，以及 TCP 帧头半包后发生超时的恢复。
 
-| 手册变量 | 本项目 |
-|---|---|
-| `indat` 波形 | `DataBlock.data`（numpy, `[n_ch, n_samp]`）|
-| `inlabels` 通道标签 | `SessionInfo.labels` |
-| `insampleratehz` 采样率 | `SessionInfo.sample_rate_hz` |
-| `instartsample` 起始采样 | `FrameHeader.sample` / `DataBlock.start_sample` |
-| `inevents` 事件 | `DataBlock.events` |
+## 连接 Curry
 
----
+在 Curry 中启用 NetStreaming Server，使用未压缩 float32 数据格式，然后运行：
 
-## 用法
-
-### 1. 跑单元测试（不需要 Curry / 硬件）
-
-```bash
-./.conda/bin/python -m pytest
+```powershell
+python scripts/run_client.py `
+  --host <Curry-IP> `
+  --port 4455 `
+  --expected-seconds 30 `
+  --dump capture.bin `
+  --log-level DEBUG
 ```
 
-这是「只做客户端」时的主要调试路径：在 `tests/test_protocol.py` 打断点，
-逐步检查帧头打包/解包、控制指令编码、float32 整形等逻辑。
+程序会为每个 EEG 包打印：
 
-### 2. 连接真实 Curry Server
-
-在 Curry：`Acquisition → Amplifier Control → NetStreaming` 把本机设为
-**Server**（非压缩格式、固定端口），并勾选 *Allow Client to control amplifier*。
-
-```bash
-# 接收并打印数据块
-./.conda/bin/python scripts/run_client.py --host <CurryIP> --port <端口>
-
-# DEBUG 级 + 原始字节落盘（逆向协议时极有用）
-./.conda/bin/python scripts/run_client.py --host <CurryIP> --port <端口> \
-    --log-level DEBUG --dump capture.bin --max-blocks 20
-
-# 演示控制流：连上先发阻抗检测，收满 10 块后发停止录制
-./.conda/bin/python scripts/run_client.py --host <CurryIP> --port <端口> \
-    --send-impedance --stop-after 10
+```text
+[block 1] start_sample=... shape=(通道数, 采样点数) sr=...Hz duration=30.000s
 ```
 
----
+`--dump` 会保留原始入站字节，便于真机验证失败时复现。用 `--max-blocks 2`
+可以在收到两个 EEG 包后自动请求停止推流并退出。
 
-## 校准协议的步骤（拿到官方 demo 后）
+纯诊断模式不会解析数据：
 
-1. 用 `--dump capture.bin` 抓真实字节流；
-2. 对照 C++ demo，确认帧头字段顺序/长度、消息码取值、payload 是否含事件/是否压缩；
-3. 只改 `protocol.py` 的 `HEADER_FORMAT` / `MessageCode` / `SAMPLE_DTYPE`，
-   以及 `client.py` 里两个 `_handle_*` 的 PLACEHOLDER 解析；
-4. 跑 `pytest` 确认协议层仍自洽。
+```powershell
+python scripts/run_client.py --host <Curry-IP> --port 4455 `
+  --peek 70 --dump capture_70s.bin --log-level DEBUG
+```
 
----
+## 代码结构
 
-## 参考
-
-- CURRY 8 User Guide p.252–257《14.2.1.1 Configure as NetStreaming Server or Client》
-- 事件码表：User Guide p.553 起
-- 触发/TTL（硬件打标记）：User Guide 附录 A，p.984–989
+```text
+src/curry_netstream/protocol.py  协议常量、结构体和 EEG 解码
+src/curry_netstream/client.py    TCP 连接、自动握手、分帧和分发
+src/curry_netstream/models.py    SessionInfo / DataBlock
+scripts/run_client.py            命令行真机入口
+tests/                            协议及合成端到端测试
+```

@@ -8,13 +8,24 @@
 """
 from .client import CurryClient
 from .models import DataBlock, Event, SessionInfo
-from .protocol import FrameHeader, encode_control
+from .protocol import (
+    BasicInfo,
+    ChannelInfo,
+    FrameHeader,
+    decode_channel_info,
+    decode_eeg_payload,
+    encode_control,
+)
 
 __all__ = [
     "CurryClient",
     "DataBlock",
     "Event",
     "SessionInfo",
+    "BasicInfo",
+    "ChannelInfo",
     "FrameHeader",
+    "decode_channel_info",
+    "decode_eeg_payload",
     "encode_control",
 ]

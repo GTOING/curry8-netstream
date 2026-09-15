@@ -1,90 +1,124 @@
-"""协议层单元测试 —— 含【真实抓包】回归用例，无需任何服务器或硬件。
-
-这是调试入口：可在此打断点，逐步检查 20 字节大端帧头的打包/解包、
-控制消息编码、float32 payload 整形等逻辑。
-"""
+"""Protocol tests, including two real captured Curry CTRL headers."""
 from __future__ import annotations
 
 import struct
+import unittest
 
 import numpy as np
-import pytest
 
 from curry_netstream.protocol import (
+    BASIC_INFO_FORMAT,
+    BASIC_INFO_SIZE,
+    CHANNEL_INFO_FORMAT,
+    CHANNEL_INFO_SIZE,
+    CTRL_FROM_CLIENT,
     HEADER_FORMAT,
     HEADER_SIZE,
     ID_CTRL,
-    SAMPLE_DTYPE,
+    BasicInfo,
     FrameHeader,
+    decode_channel_info,
+    decode_eeg_payload,
     encode_control,
 )
 
-# 来自真实抓包 capture.bin：连接 Curry NetStreaming Server 后收到的第一条消息
 REAL_CTRL_MSG_1 = bytes.fromhex("4354524c00010002000000000000000000000000")
 REAL_CTRL_MSG_2 = bytes.fromhex("4354524c00010001000000000000000000000000")
 
 
-def test_header_size_is_20() -> None:
-    assert HEADER_SIZE == struct.calcsize(HEADER_FORMAT)
-    assert HEADER_SIZE == 20
-
-
-def test_decode_real_capture() -> None:
-    """用真实字节验证帧头解析（回归用例）。"""
-    h1 = FrameHeader.unpack(REAL_CTRL_MSG_1)
-    assert h1.chid == ID_CTRL  # b"CTRL"
-    assert h1.code == 1
-    assert h1.request == 2
-    assert h1.sample == 0
-    assert h1.data_size == 0  # 纯控制消息，无 payload
-
-    h2 = FrameHeader.unpack(REAL_CTRL_MSG_2)
-    assert h2.chid == ID_CTRL
-    assert h2.code == 1
-    assert h2.request == 1
-    assert h2.data_size == 0
-
-
-def test_header_roundtrip() -> None:
-    h = FrameHeader(
-        chid=b"DATA", code=2, request=0, sample=1000, size1=256, size2=0
+def make_channel_info(channel_id: int, label: str) -> bytes:
+    raw_label = label.encode("utf-16-le")[:78] + b"\x00\x00"
+    raw_label = raw_label.ljust(80, b"\x00")
+    return struct.pack(
+        CHANNEL_INFO_FORMAT,
+        channel_id,
+        raw_label,
+        0,
+        0,
+        0,
+        0.0,
+        0.0,
+        0.0,
+        0,
+        -1,
+        1.0,
+        0,
+        0,
+        0,
     )
-    raw = h.pack()
-    assert len(raw) == HEADER_SIZE
-
-    back = FrameHeader.unpack(raw)
-    assert back.chid == b"DATA"
-    assert back.code == 2
-    assert back.sample == 1000
-    assert back.data_size == 256
 
 
-def test_encode_control_is_header_only() -> None:
-    raw = encode_control(code=1, request=20)
-    assert len(raw) == HEADER_SIZE
+class ProtocolTests(unittest.TestCase):
+    def test_protocol_struct_sizes(self) -> None:
+        self.assertEqual(HEADER_SIZE, struct.calcsize(HEADER_FORMAT))
+        self.assertEqual(HEADER_SIZE, 20)
+        self.assertEqual(BASIC_INFO_SIZE, 24)
+        self.assertEqual(CHANNEL_INFO_SIZE, 144)
 
-    h = FrameHeader.unpack(raw)
-    assert h.chid == ID_CTRL
-    assert h.code == 1
-    assert h.request == 20
-    assert h.data_size == 0
+    def test_decode_real_capture(self) -> None:
+        h1 = FrameHeader.unpack(REAL_CTRL_MSG_1)
+        self.assertEqual((h1.chid, h1.code, h1.request), (ID_CTRL, 1, 2))
+        self.assertEqual((h1.sample, h1.data_size), (0, 0))
+
+        h2 = FrameHeader.unpack(REAL_CTRL_MSG_2)
+        self.assertEqual((h2.chid, h2.code, h2.request), (ID_CTRL, 1, 1))
+        self.assertEqual(h2.data_size, 0)
+
+    def test_header_roundtrip(self) -> None:
+        original = FrameHeader(b"DATA", 2, 1, 1000, 256, 0)
+        decoded = FrameHeader.unpack(original.pack())
+        self.assertEqual(decoded, original)
+
+    def test_encode_client_control(self) -> None:
+        header = FrameHeader.unpack(encode_control(request=8))
+        self.assertEqual(header.chid, ID_CTRL)
+        self.assertEqual(header.code, CTRL_FROM_CLIENT)
+        self.assertEqual(header.request, 8)
+        self.assertEqual(header.data_size, 0)
+
+    def test_unpack_rejects_wrong_header_size(self) -> None:
+        with self.assertRaises(ValueError):
+            FrameHeader.unpack(b"\x00" * (HEADER_SIZE - 1))
+
+    def test_decode_basic_info(self) -> None:
+        payload = struct.pack(BASIC_INFO_FORMAT, 24, 2, 500, 4, 1, 0)
+        info = BasicInfo.unpack(payload)
+        self.assertEqual(info.n_eeg_channels, 2)
+        self.assertEqual(info.sample_rate_hz, 500)
+        self.assertEqual(info.data_size, 4)
+        self.assertTrue(info.allow_client_control_amp)
+        self.assertFalse(info.allow_client_control_recording)
+
+    def test_decode_channel_info(self) -> None:
+        channels = decode_channel_info(
+            make_channel_info(1, "C3") + make_channel_info(2, "C4")
+        )
+        self.assertEqual([item.channel_id for item in channels], [1, 2])
+        self.assertEqual([item.label for item in channels], ["C3", "C4"])
+
+    def test_decode_sample_major_eeg(self) -> None:
+        # Wire order: sample0(C3,C4), sample1(C3,C4), sample2(C3,C4).
+        wire_values = np.array([1, 10, 2, 20, 3, 30], dtype="<f4")
+        eeg = decode_eeg_payload(wire_values.tobytes(), n_channels=2)
+        self.assertEqual(eeg.shape, (2, 3))
+        np.testing.assert_array_equal(eeg[0], [1, 2, 3])
+        np.testing.assert_array_equal(eeg[1], [10, 20, 30])
+
+    def test_decode_complete_30_second_block(self) -> None:
+        n_channels, sample_rate_hz, seconds = 2, 500, 30
+        n_samples = sample_rate_hz * seconds
+        wire_values = np.arange(n_samples * n_channels, dtype="<f4")
+        eeg = decode_eeg_payload(wire_values.tobytes(), n_channels)
+        self.assertEqual(eeg.shape, (n_channels, n_samples))
+        self.assertEqual(eeg[0, 0], 0.0)
+        self.assertEqual(eeg[1, 0], 1.0)
+        self.assertEqual(eeg[0, 1], 2.0)
+
+    def test_decode_eeg_rejects_incomplete_sample(self) -> None:
+        payload = np.array([1, 2, 3], dtype="<f4").tobytes()
+        with self.assertRaises(ValueError):
+            decode_eeg_payload(payload, n_channels=2)
 
 
-def test_unpack_rejects_wrong_size() -> None:
-    with pytest.raises(ValueError):
-        FrameHeader.unpack(b"\x00" * (HEADER_SIZE - 1))
-
-
-def test_data_payload_reshape() -> None:
-    """模拟一块 4 通道 × 5 采样的 float32 payload，验证整形逻辑。"""
-    n_ch, n_samp = 4, 5
-    samples = np.arange(n_ch * n_samp, dtype=np.float32)
-    payload = samples.tobytes()
-
-    arr = np.frombuffer(payload, dtype=SAMPLE_DTYPE)
-    assert arr.size == n_ch * n_samp
-
-    data = arr.reshape(n_ch, -1)
-    assert data.shape == (n_ch, n_samp)
-    np.testing.assert_array_equal(data[0], [0, 1, 2, 3, 4])
-    np.testing.assert_array_equal(data[3], [15, 16, 17, 18, 19])
+if __name__ == "__main__":
+    unittest.main()

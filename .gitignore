@@ -8,6 +8,12 @@
 *.bin
 capture*.bin
 
+# 本地参考源码与数据（不提交）
+/reference/
+
+# 本地 CodeGraph 索引（不提交）
+/.codegraph/
+
 # Python
 __pycache__/
 *.py[cod]
