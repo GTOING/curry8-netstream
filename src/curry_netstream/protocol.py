@@ -1,7 +1,7 @@
 """Curry 8 NetStreaming wire protocol.
 
-The layout in this module is derived from the local Curry reference client in
-``reference/P300Speller-pyQt_v202410/scutbci-pyqt-p300``. Multi-byte fields in
+The layout in this module is derived from the curated local Curry client in
+``reference/curry_netstream_protocol``. Multi-byte fields in
 the 20-byte message header use network byte order; DATA payload structures and
 uncompressed EEG float samples use little-endian byte order.
 """

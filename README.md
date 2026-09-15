@@ -13,10 +13,41 @@ shape = [EEG 通道数, 每通道采样点数]
 每通道采样点数 = fs × 30
 ```
 
+## 当前进度（2026-09-15）
+
+当前目标只包括“稳定接收并完整解码每个 30 秒 EEG 数据包”，暂不包括
+睡眠分期模型、信号预处理和结果回传。
+
+| 环节 | 状态 | 说明 |
+|---|---|---|
+| 参考协议筛选 | 已完成 | 已从约 2.54 GB 旧工程中保留 3 个 Curry 协议相关文件 |
+| 20 字节消息头 | 已完成 | 大端 `>4sHHIII`，并有真实 CTRL 抓包回归测试 |
+| 自动握手 | 已完成 | BasicInfo → ChannelInfo → StreamingStart |
+| 基础/通道信息 | 已完成 | 解析通道数、采样率、数据大小及 UTF-16LE 标签 |
+| EEG payload 解码 | 已完成 | 未压缩小端 float32，输出 `[channel, sample]` |
+| TCP 完整收包 | 已完成 | 支持断包、跨超时保留、payload 上限保护 |
+| 连续性与 30 秒检查 | 已完成 | 检查 `start_sample` 连续性和每包持续时间 |
+| 自动化测试 | 已完成 | 11 项测试全部通过，含完整 30 秒合成数据块 |
+| Curry 8 真机验证 | 待完成 | 需要连接目标设备获取至少两个真实 EEG 包 |
+
+代码功能已经实现，当前唯一关键缺口是目标 Curry 8 的真实网络数据。真机测试
+通过前，不能把“参考协议和合成测试通过”等同于“目标设备已验证”。
+
 ## 协议依据与当前边界
 
-协议实现已根据本地 `reference/` 中的 Curry Python 参考客户端完成。该目录
-只用于本机分析，已由 `.gitignore` 排除，不会提交。
+协议实现已根据本地 `reference/curry_netstream_protocol/` 中的 Curry Python
+参考客户端完成。当前仅保留：
+
+```text
+reference/curry_netstream_protocol/
+  currydefs.py       包头、消息码和协议结构体
+  currystreaming.py  自动握手、DATA 分发和 EEG 排列
+  tcpclient.py       TCP 接收与缓存参考
+```
+
+`reference/` 只用于本机分析，已由 `.gitignore` 排除，不会提交。重复副本、
+旧 C++ COM 工程、离线 MATLAB、GUI、音频及编译产物已移入
+`trash/reference_unrelated_2026-09-15/`，同样不会提交；由使用者手动清理。
 
 当前已经明确并实现：
 
@@ -51,7 +82,7 @@ shape = [EEG 通道数, 每通道采样点数]
 
 ## 环境
 
-依赖 Python 3.11+ 和 NumPy。可以用 Conda 创建环境：
+依赖 Python 3.10+ 和 NumPy。可以用 Conda 创建环境：
 
 ```powershell
 conda env create -f environment.yml
@@ -67,8 +98,9 @@ $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖真实 CTRL 抓包回归、协议结构尺寸、基础/通道信息、交织 EEG 解码、
-自动握手，以及 TCP 帧头半包后发生超时的恢复。
+当前 11 项测试全部通过，覆盖真实 CTRL 抓包回归、协议结构尺寸、基础/通道
+信息、交织 EEG 解码、完整 30 秒合成块、自动握手、连续数据包，以及 TCP
+帧头半包后发生超时的恢复。
 
 ## 连接 Curry
 
@@ -78,8 +110,9 @@ python -m unittest discover -s tests -v
 python scripts/run_client.py `
   --host <Curry-IP> `
   --port 4455 `
+  --max-blocks 2 `
   --expected-seconds 30 `
-  --dump capture.bin `
+  --dump capture_2blocks.bin `
   --log-level DEBUG
 ```
 
@@ -91,6 +124,20 @@ python scripts/run_client.py `
 
 `--dump` 会保留原始入站字节，便于真机验证失败时复现。用 `--max-blocks 2`
 可以在收到两个 EEG 包后自动请求停止推流并退出。
+
+### 真机验收标准
+
+至少连续收到两个数据包，并同时满足：
+
+1. 每包输出 `duration=30.000s`；
+2. 数组形状为 `(EEG通道数, 采样率 × 30)`；
+3. 通道标签、数量和 Curry 当前配置一致；
+4. 后一包的 `start_sample` 等于前一包起点加前一包采样数；
+5. EEG 数值有限且量级合理，不出现整块 `NaN/Inf` 或明显字节序错误；
+6. `capture_2blocks.bin` 能用于离线复现同样的解码结果。
+
+若输出提示压缩 EEG，请在 Curry NetStreaming Server 中选择未压缩 float32
+格式；当前版本明确拒绝 ZIP payload，避免把压缩字节误解为 EEG。
 
 纯诊断模式不会解析数据：
 
@@ -107,4 +154,6 @@ src/curry_netstream/client.py    TCP 连接、自动握手、分帧和分发
 src/curry_netstream/models.py    SessionInfo / DataBlock
 scripts/run_client.py            命令行真机入口
 tests/                            协议及合成端到端测试
+reference/curry_netstream_protocol/ 本地协议参考（已忽略）
+trash/                            待手动清理文件（已忽略）
 ```

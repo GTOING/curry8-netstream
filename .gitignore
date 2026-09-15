@@ -14,6 +14,9 @@ capture*.bin
 # 本地 CodeGraph 索引（不提交）
 /.codegraph/
 
+# 手动清理区（不提交）
+/trash/
+
 # Python
 __pycache__/
 *.py[cod]
