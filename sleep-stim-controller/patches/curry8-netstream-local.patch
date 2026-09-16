@@ -1,0 +1,441 @@
+diff --git a/README.md b/README.md
+index 26f6bd2..0c7248f 100644
+--- a/README.md
++++ b/README.md
+@@ -26,6 +26,7 @@ shape = [EEG 通道数, 每通道采样点数]
+ | 基础/通道信息 | 已完成 | 解析通道数、采样率、数据大小及 UTF-16LE 标签 |
+ | EEG payload 解码 | 已完成 | 未压缩小端 float32，输出 `[channel, sample]` |
+ | TCP 完整收包 | 已完成 | 支持断包、跨超时保留、payload 上限保护 |
++| 可取消接收与结果观察 | 已完成 | 接收轮询保留半包，支持取消事件、状态/会话回调及 EOF/协议错误结果 |
+ | 连续性与 30 秒检查 | 已完成 | 检查 `start_sample` 连续性和每包持续时间 |
+ | 自动化测试 | 已完成 | 11 项测试全部通过，含完整 30 秒合成数据块 |
+ | Curry 8 真机验证 | 待完成 | 需要连接目标设备获取至少两个真实 EEG 包 |
+@@ -77,7 +78,7 @@ reference/curry_netstream_protocol/
+   → 请求开始推流（request=8）
+   → 接收 DATA_Eeg / Float32（code=2, request=1）
+   → 输出 DataBlock.data[channel, sample]
+-  → 结束时请求停止推流（request=9）
++→ 结束时尽力请求停止推流（request=9）
+ ```
+ 
+ ## 环境
+@@ -102,6 +103,12 @@ python -m unittest discover -s tests -v
+ 信息、交织 EEG 解码、完整 30 秒合成块、自动握手、连续数据包，以及 TCP
+ 帧头半包后发生超时的恢复。
+ 
++`CurryClient` 的 `timeout` 默认 3 秒；连接后使用短接收轮询超时，短暂静默
++不会被判为失败。`stream()` 仍可按原方式忽略返回值；需要生命周期观察时，
++可读取 `StreamResult`，并通过 `cancel_event`、`on_status`、`on_session` 和
++`on_error` 取得取消、握手和错误信息。`CurryClient.cancel()` 只请求合作式
++停止，最终由拥有客户端的线程执行关闭。
++
+ ## 连接 Curry
+ 
+ 在 Curry 中启用 NetStreaming Server，使用未压缩 float32 数据格式，然后运行：
+diff --git a/src/curry_netstream/__init__.py b/src/curry_netstream/__init__.py
+index 71fbdf2..931596f 100644
+--- a/src/curry_netstream/__init__.py
++++ b/src/curry_netstream/__init__.py
+@@ -6,7 +6,7 @@
+   client       —— CurryClient：TCP 连接、收包重组、分发、发控制指令
+   logging_util —— 日志 + hexdump
+ """
+-from .client import CurryClient
++from .client import CurryClient, CurryClientCancelled, StreamResult
+ from .models import DataBlock, Event, SessionInfo
+ from .protocol import (
+     BasicInfo,
+@@ -19,6 +19,8 @@ from .protocol import (
+ 
+ __all__ = [
+     "CurryClient",
++    "CurryClientCancelled",
++    "StreamResult",
+     "DataBlock",
+     "Event",
+     "SessionInfo",
+diff --git a/src/curry_netstream/client.py b/src/curry_netstream/client.py
+index acd8aec..c5f57f5 100644
+--- a/src/curry_netstream/client.py
++++ b/src/curry_netstream/client.py
+@@ -12,6 +12,8 @@ from __future__ import annotations
+ import logging
+ import socket
+ import time
++from dataclasses import dataclass
++from threading import Event
+ from typing import BinaryIO, Callable, Optional
+ 
+ from .logging_util import hexdump
+@@ -55,6 +57,28 @@ from .protocol import (
+ log = logging.getLogger("curry.client")
+ 
+ DataCallback = Callable[[DataBlock], None]
++StatusCallback = Callable[[str], None]
++SessionCallback = Callable[[SessionInfo], None]
++ErrorCallback = Callable[[BaseException], None]
++
++
++class CurryClientCancelled(Exception):
++    """Raised internally when a caller cancels a blocking receive."""
++
++
++@dataclass(slots=True)
++class StreamResult:
++    """Outcome of one :meth:`CurryClient.stream` invocation.
++
++    The return value is additive to the original blocking API: callers that
++    ignored the old ``None`` return value keep working, while the desktop
++    adapter can distinguish an EOF/protocol failure from an intentional stop.
++    """
++
++    blocks_received: int = 0
++    cancelled: bool = False
++    completed: bool = False
++    error: BaseException | None = None
+ 
+ 
+ class CurryClient:
+@@ -72,13 +96,19 @@ class CurryClient:
+         host: str,
+         port: int,
+         *,
+-        timeout: float = 5.0,
++        timeout: float = 3.0,
++        receive_timeout: float = 0.25,
+         dump_path: Optional[str] = None,
+         max_payload_bytes: int = 512 * 1024 * 1024,
+     ) -> None:
++        if timeout <= 0:
++            raise ValueError("连接超时必须大于 0 秒")
++        if receive_timeout <= 0:
++            raise ValueError("接收轮询超时必须大于 0 秒")
+         self.host = host
+         self.port = port
+         self.timeout = timeout
++        self.receive_timeout = receive_timeout
+         self.max_payload_bytes = max_payload_bytes
+         self._dump_path = dump_path
+         self._sock: Optional[socket.socket] = None
+@@ -89,22 +119,87 @@ class CurryClient:
+         self._running = False
+         self._streaming_requested = False
+         self._next_sample: Optional[int] = None
++        self._cancel_event = Event()
++
++    def _prepare_cancel_event(self, cancel_event: Event | None) -> Event:
++        if cancel_event is not None:
++            self._cancel_event = cancel_event
++        elif self._cancel_event.is_set():
++            self._cancel_event = Event()
++        return self._cancel_event
++
++    def _check_cancelled(self) -> None:
++        if self._cancel_event.is_set():
++            raise CurryClientCancelled("用户已取消 Curry 接收")
++
++    @staticmethod
++    def _notify(
++        callback: Callable[[object], None] | None,
++        value: object,
++    ) -> None:
++        if callback is None:
++            return
++        try:
++            callback(value)
++        except Exception:
++            # Observers must not be able to break the protocol receive loop.
++            log.exception("Curry 客户端状态回调失败")
+ 
+     # ------------------------------------------------------------------ #
+     # 连接管理
+     # ------------------------------------------------------------------ #
+-    def connect(self) -> None:
++    def connect(self, *, cancel_event: Event | None = None) -> None:
++        self._prepare_cancel_event(cancel_event)
++        self._check_cancelled()
++        self._basic_info = None
++        self._channel_info = []
++        self._session = None
++        self._next_sample = None
++        self._streaming_requested = False
+         log.info("连接 Curry NetStreaming Server %s:%d ...", self.host, self.port)
+-        self._sock = socket.create_connection(
+-            (self.host, self.port), timeout=self.timeout
+-        )
+-        self._sock.settimeout(self.timeout)
+-        if self._dump_path:
+-            self._dump = open(self._dump_path, "wb")
+-            log.info("原始字节将写入 %s（逆向协议用）", self._dump_path)
+-        log.info("已连接。")
++        sock: socket.socket | None = None
++        try:
++            sock = socket.create_connection(
++                (self.host, self.port), timeout=self.timeout
++            )
++            self._check_cancelled()
++            self._sock = sock
++            # A short receive poll keeps idle waits cancellable. It does not
++            # turn a short timeout into a failure; _recv_exact simply resumes.
++            self._sock.settimeout(self.receive_timeout)
++            if self._dump_path:
++                self._dump = open(self._dump_path, "wb")
++                log.info("原始字节将写入 %s（逆向协议用）", self._dump_path)
++            log.info("已连接。")
++        except OSError as exc:
++            if sock is not None:
++                sock.close()
++                if self._sock is sock:
++                    self._sock = None
++            if self._cancel_event.is_set():
++                raise CurryClientCancelled("用户已取消 Curry 连接") from exc
++            raise
++        except CurryClientCancelled:
++            if sock is not None and self._sock is None:
++                sock.close()
++            if self._sock is not None:
++                self._sock.close()
++                self._sock = None
++            raise
++
++    def cancel(self) -> None:
++        """Request a cooperative stop without closing the socket from the UI."""
++        self._cancel_event.set()
++        self._running = False
++        if self._sock is not None:
++            try:
++                self._sock.settimeout(min(self.receive_timeout, 0.1))
++            except (AttributeError, OSError):
++                # Test doubles and already-closed sockets need no extra wakeup.
++                pass
+ 
+     def close(self) -> None:
++        self._cancel_event.set()
+         self._running = False
+         if self._sock is not None:
+             try:
+@@ -119,6 +214,8 @@ class CurryClient:
+         if self._dump is not None:
+             self._dump.close()
+             self._dump = None
++        self._streaming_requested = False
++        self._next_sample = None
+         log.info("连接已关闭。")
+ 
+     def __enter__(self) -> "CurryClient":
+@@ -190,11 +287,16 @@ class CurryClient:
+             raise ConnectionError("未连接")
+         buf = bytearray()
+         while len(buf) < n:
++            self._check_cancelled()
+             try:
+                 chunk = self._sock.recv(n - len(buf))
+             except (socket.timeout, TimeoutError):
+                 log.debug("等待剩余字节：已收到 %d/%d", len(buf), n)
+                 continue
++            except OSError as exc:
++                if self._cancel_event.is_set():
++                    raise CurryClientCancelled("用户已取消 Curry 接收") from exc
++                raise ConnectionError(f"接收 Curry 数据失败: {exc}") from exc
+             if not chunk:
+                 raise ConnectionError("服务器关闭了连接")
+             buf += chunk
+@@ -224,7 +326,14 @@ class CurryClient:
+     # ------------------------------------------------------------------ #
+     # DATA_Info / DATA_Eeg 解码
+     # ------------------------------------------------------------------ #
+-    def _handle_info(self, header: FrameHeader, payload: bytes) -> None:
++    def _handle_info(
++        self,
++        header: FrameHeader,
++        payload: bytes,
++        *,
++        on_status: StatusCallback | None = None,
++        on_session: SessionCallback | None = None,
++    ) -> None:
+         """Handle one DATA_Info subtype and advance the Curry handshake."""
+         if header.request == INFO_BASIC_INFO:
+             self._basic_info = BasicInfo.unpack(payload)
+@@ -239,6 +348,7 @@ class CurryClient:
+                 self._basic_info.sample_rate_hz,
+                 self._basic_info.data_size,
+             )
++            self._notify(on_status, "waiting_channel_info")
+             self.request_channel_info()
+         elif header.request == INFO_CHANNEL_INFO:
+             if self._basic_info is None or self._session is None:
+@@ -250,13 +360,17 @@ class CurryClient:
+                     f"通道信息只有 {len(self._channel_info)} 条，少于 EEG 通道数 {n_eeg}"
+                 )
+             labels = [item.label for item in self._channel_info[:n_eeg]]
++            if any(not label.strip() for label in labels):
++                raise ValueError("通道信息包含空 EEG 标签，不能开始接收")
+             self._session = SessionInfo(
+                 n_channels=n_eeg,
+                 sample_rate_hz=float(self._basic_info.sample_rate_hz),
+                 labels=labels,
+             )
+             log.info("通道信息就绪: %s", ", ".join(labels))
++            self._notify(on_session, self._session)
+             self.start_streaming()
++            self._notify(on_status, "streaming")
+         elif header.request == INFO_VERSION and len(payload) == 4:
+             version = int.from_bytes(payload, "little")
+             log.info("NetStreaming 协议版本: %d", version)
+@@ -278,6 +392,10 @@ class CurryClient:
+         sess = self._session
+         if sess is None or sess.n_channels <= 0 or sess.sample_rate_hz <= 0:
+             raise ValueError("会话信息未就绪，无法可靠解码 EEG")
++        if len(sess.labels) != sess.n_channels or any(
++            not label.strip() for label in sess.labels
++        ):
++            raise ValueError("通道标签信息未就绪，无法可靠交付 EEG")
+         data = decode_eeg_payload(payload, sess.n_channels)
+         if self._next_sample is not None and header.sample != self._next_sample:
+             raise ValueError(
+@@ -301,58 +419,98 @@ class CurryClient:
+         on_data: DataCallback,
+         *,
+         max_blocks: Optional[int] = None,
+-    ) -> None:
+-        """完成握手并阻塞接收；每个 EEG 包回调一个 DataBlock。"""
++        cancel_event: Event | None = None,
++        on_status: StatusCallback | None = None,
++        on_session: SessionCallback | None = None,
++        on_error: ErrorCallback | None = None,
++    ) -> StreamResult:
++        """完成握手并阻塞接收；每个 EEG 包回调一个 DataBlock。
++
++        ``socket.timeout`` is intentionally treated as an idle poll. A
++        caller can set ``cancel_event`` (or call :meth:`cancel`) at any time;
++        the current frame's partial bytes remain local until cancellation or
++        the next complete frame.
++        """
++        self._prepare_cancel_event(cancel_event)
+         self._running = True
+-        n = 0
+-        self.request_basic_info()
+-        while self._running:
+-            try:
++        result = StreamResult()
++        self._notify(on_status, "handshaking")
++        try:
++            self._check_cancelled()
++            self.request_basic_info()
++            self._notify(on_status, "waiting_basic_info")
++            while self._running:
++                self._check_cancelled()
+                 header, payload = self._read_frame()
+-            except (ConnectionError, OSError) as exc:
+-                log.error("连接中断: %s", exc)
+-                break
+-            except ValueError as exc:
+-                log.error("协议错误，停止接收: %s", exc)
+-                raise
+-
+-            if header.chid == ID_CTRL:
+-                log.info(
+-                    "CTRL 控制消息: code=%d request=%d (payload %dB)",
+-                    header.code, header.request, len(payload),
+-                )
+-            elif header.chid == ID_DATA and header.code == DATA_INFO:
+-                self._handle_info(header, payload)
+-            elif header.chid == ID_DATA and header.code == DATA_EEG:
+-                if header.request == DATA_TYPE_FLOAT32:
+-                    block = self._handle_data(header, payload)
+-                    on_data(block)
+-                    n += 1
+-                    if max_blocks is not None and n >= max_blocks:
+-                        log.info("已达 max_blocks=%d，停止接收。", max_blocks)
+-                        break
+-                elif header.request == DATA_TYPE_FLOAT32_ZIP:
+-                    raise ValueError(
+-                        "不支持压缩 EEG；请在 Curry 中选择未压缩 float32"
++
++                if header.chid == ID_CTRL:
++                    log.info(
++                        "CTRL 控制消息: code=%d request=%d (payload %dB)",
++                        header.code, header.request, len(payload),
++                    )
++                elif header.chid == ID_DATA and header.code == DATA_INFO:
++                    self._handle_info(
++                        header,
++                        payload,
++                        on_status=on_status,
++                        on_session=on_session,
+                     )
++                elif header.chid == ID_DATA and header.code == DATA_EEG:
++                    if header.request == DATA_TYPE_FLOAT32:
++                        block = self._handle_data(header, payload)
++                        on_data(block)
++                        result.blocks_received += 1
++                        if (
++                            max_blocks is not None
++                            and result.blocks_received >= max_blocks
++                        ):
++                            log.info(
++                                "已达 max_blocks=%d，停止接收。", max_blocks
++                            )
++                            result.completed = True
++                            break
++                    elif header.request == DATA_TYPE_FLOAT32_ZIP:
++                        raise ValueError(
++                            "不支持压缩 EEG；请在 Curry 中选择未压缩 float32"
++                        )
++                    else:
++                        log.warning("不支持的 EEG 数据类型: %d", header.request)
++                elif header.chid == ID_DATA and header.code == DATA_EVENTS:
++                    if header.request == DATA_TYPE_EVENT_LIST:
++                        log.debug("忽略事件包: %dB（当前目标仅 EEG）", len(payload))
++                elif header.chid == ID_DATA and header.code == DATA_IMPEDANCES:
++                    log.debug("忽略阻抗包: %dB", len(payload))
+                 else:
+-                    log.warning("不支持的 EEG 数据类型: %d", header.request)
+-            elif header.chid == ID_DATA and header.code == DATA_EVENTS:
+-                if header.request == DATA_TYPE_EVENT_LIST:
+-                    log.debug("忽略事件包: %dB（当前目标仅 EEG）", len(payload))
+-            elif header.chid == ID_DATA and header.code == DATA_IMPEDANCES:
+-                log.debug("忽略阻抗包: %dB", len(payload))
++                    log.warning(
++                        "未处理帧 id=%r code=%d request=%d payload=%dB",
++                        header.chid, header.code, header.request, len(payload),
++                    )
++        except CurryClientCancelled:
++            result.cancelled = True
++            log.info("Curry 接收已取消")
++        except (ConnectionError, OSError) as exc:
++            if self._cancel_event.is_set():
++                result.cancelled = True
++                log.info("取消期间连接结束: %s", exc)
+             else:
+-                log.warning(
+-                    "未处理帧 id=%r code=%d request=%d payload=%dB",
+-                    header.chid, header.code, header.request, len(payload),
+-                )
+-
+-        if self._streaming_requested and self._sock is not None:
+-            try:
+-                self.stop_streaming()
+-            except OSError:
+-                pass
++                result.error = exc
++                log.error("连接中断: %s", exc)
++                self._notify(on_error, exc)
++        except ValueError as exc:
++            result.error = exc
++            log.error("协议错误，停止接收: %s", exc)
++            self._notify(on_error, exc)
++            raise
++        finally:
++            self._running = False
++            if self._streaming_requested and self._sock is not None:
++                self._notify(on_status, "stopping")
++                try:
++                    self.stop_streaming()
++                except OSError:
++                    if not self._cancel_event.is_set():
++                        log.exception("发送停止推流请求失败")
++        return result
+ 
+     # ------------------------------------------------------------------ #
+     # 控制流（客户端 -> 服务器）

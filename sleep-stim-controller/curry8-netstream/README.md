@@ -26,6 +26,7 @@ shape = [EEG 通道数, 每通道采样点数]
 | 基础/通道信息 | 已完成 | 解析通道数、采样率、数据大小及 UTF-16LE 标签 |
 | EEG payload 解码 | 已完成 | 未压缩小端 float32，输出 `[channel, sample]` |
 | TCP 完整收包 | 已完成 | 支持断包、跨超时保留、payload 上限保护 |
+| 可取消接收与结果观察 | 已完成 | 接收轮询保留半包，支持取消事件、状态/会话回调及 EOF/协议错误结果 |
 | 连续性与 30 秒检查 | 已完成 | 检查 `start_sample` 连续性和每包持续时间 |
 | 自动化测试 | 已完成 | 11 项测试全部通过，含完整 30 秒合成数据块 |
 | Curry 8 真机验证 | 待完成 | 需要连接目标设备获取至少两个真实 EEG 包 |
@@ -77,7 +78,7 @@ reference/curry_netstream_protocol/
   → 请求开始推流（request=8）
   → 接收 DATA_Eeg / Float32（code=2, request=1）
   → 输出 DataBlock.data[channel, sample]
-  → 结束时请求停止推流（request=9）
+→ 结束时尽力请求停止推流（request=9）
 ```
 
 ## 环境
@@ -101,6 +102,12 @@ python -m unittest discover -s tests -v
 当前 11 项测试全部通过，覆盖真实 CTRL 抓包回归、协议结构尺寸、基础/通道
 信息、交织 EEG 解码、完整 30 秒合成块、自动握手、连续数据包，以及 TCP
 帧头半包后发生超时的恢复。
+
+`CurryClient` 的 `timeout` 默认 3 秒；连接后使用短接收轮询超时，短暂静默
+不会被判为失败。`stream()` 仍可按原方式忽略返回值；需要生命周期观察时，
+可读取 `StreamResult`，并通过 `cancel_event`、`on_status`、`on_session` 和
+`on_error` 取得取消、握手和错误信息。`CurryClient.cancel()` 只请求合作式
+停止，最终由拥有客户端的线程执行关闭。
 
 ## 连接 Curry
 
@@ -157,8 +164,3 @@ tests/                            协议及合成端到端测试
 reference/curry_netstream_protocol/ 本地协议参考（已忽略）
 trash/                            待手动清理文件（已忽略）
 ```
-
-
-## 睡眠分期电刺激控制器
-
-完整控制器项目位于 [sleep-stim-controller](sleep-stim-controller/README.md)，包括 GUI、分期接口、会话记录/回放、刺激策略及 Rally 本机模拟。正式目标 Windows，真实 Rally/设备及同步尚未联调；模型暂未接入。该目录附带当前 Curry 依赖源码，可从该目录运行 `uv sync --locked`。

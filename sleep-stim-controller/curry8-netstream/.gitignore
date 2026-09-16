@@ -1,0 +1,31 @@
+# conda 环境（项目内 prefix，体积大，不入库）
+/.conda/
+
+# 厂商版权文档，不公开发布
+*.pdf
+
+# 调试时抓取的原始字节流
+*.bin
+capture*.bin
+
+# 本地参考源码与数据（不提交）
+/reference/
+
+# 本地 CodeGraph 索引（不提交）
+/.codegraph/
+
+# 手动清理区（不提交）
+/trash/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+*.swp

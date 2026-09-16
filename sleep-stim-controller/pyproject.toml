@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sleep-stim-controller"
+version = "0.1.0"
+description = "Desktop controller for sleep staging and electrical stimulation experiments"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "curry-netstream",
+    "numpy>=1.26,<3",
+    "PySide6>=6.7,<7",
+]
+
+[project.scripts]
+sleep-stim-controller = "sleep_stim_controller.app:main"
+
+[dependency-groups]
+dev = ["pytest>=9,<10"]
+
+[tool.uv.sources]
+curry-netstream = { path = "curry8-netstream", editable = true }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "curry8-netstream/tests"]
+addopts = "-ra"

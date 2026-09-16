@@ -1,0 +1,28 @@
+# Local Python environment and build products
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Local system/editor state
+.DS_Store
+.idea/
+*.swp
+.codegraph/
+
+# Independent upstream checkout; version/source documented in README
+# Current Curry dependency source is included in this published snapshot.
+
+# Original local reference materials (preserved on disk)
+/reference/electrostimulation/original/
+/reference/desktop-ui-template/
+
+# Future local experiment outputs; never treat as disposable caches
+/data/
+/outputs/
+/logs/

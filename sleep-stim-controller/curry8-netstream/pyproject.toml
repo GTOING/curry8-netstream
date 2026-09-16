@@ -1,0 +1,11 @@
+[project]
+name = "curry-netstream"
+version = "0.1.0"
+description = "Curry 8 NetStreaming EEG receiver and decoder"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-v"
