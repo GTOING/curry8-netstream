@@ -1,11 +1,44 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QGraphicsView, QSplitter
 
 from curry_netstream.models import DataBlock, SessionInfo
 from sleep_stim_controller.ui import MainWindow
+
+
+def test_application_starts_and_closes_with_no_model_selected(qapp) -> None:
+    from sleep_stim_controller.app import build_application
+
+    application, window, controller = build_application()
+    window.show()
+    qapp.processEvents()
+    assert not window.model_enabled_checkbox.isChecked()
+    assert window.model_path_edit.text() == ""
+    assert "NoModel" in window.processing_status_label.text()
+    window.close()
+    qapp.processEvents()
+    assert not controller.is_busy()
+
+
+def test_model_configuration_rejects_missing_or_wrong_extension(qapp, tmp_path) -> None:
+    window = MainWindow()
+    try:
+        assert window.model_path_edit.text() == ""
+        with pytest.raises(ValueError, match="选择 ONNX"):
+            window.model_configuration()
+        window.model_path_edit.setText(str(tmp_path / "missing.onnx"))
+        with pytest.raises(FileNotFoundError):
+            window.model_configuration()
+        text_file = tmp_path / "model.txt"
+        text_file.write_text("not an ONNX model", encoding="utf-8")
+        window.model_path_edit.setText(str(text_file))
+        with pytest.raises(ValueError, match=".onnx"):
+            window.model_configuration()
+    finally:
+        window.close()
 
 
 def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None:
@@ -17,8 +50,32 @@ def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None
         assert window.port_spin.value() == 4455
         assert not window.findChildren(QGraphicsView)
         assert not window.findChildren(QSplitter)
-        assert "模型未接入" in window.hint_label.text()
+        assert "ONNX 睡眠分期" in window.hint_label.text()
+        assert "模型默认关闭（NoModel）" in window.hint_label.text()
         assert "真实刺激未接入" in window.hint_label.text()
+        assert not window.model_enabled_checkbox.isChecked()
+        assert not window.model_path_edit.isEnabled()
+        assert not window.choose_model_button.isEnabled()
+        assert not window.model_channel_edit.isEnabled()
+        assert window.model_path_edit.text() == ""
+        with pytest.raises(ValueError, match="选择 ONNX"):
+            window.model_configuration()
+        from sleep_stim_controller.onnx_staging import default_model_path
+
+        window.model_path_edit.setText(str(default_model_path()))
+        model_config = window.model_configuration()
+        assert model_config["model_path"].endswith("litesleepnet_edf20_fp32_6000.onnx")
+        assert model_config["channel_name"] == "Fpz-Cz"
+        window.model_enabled_checkbox.setChecked(True)
+        assert window.model_path_edit.isEnabled()
+        assert window.choose_model_button.isEnabled()
+        assert window.model_channel_edit.isEnabled()
+        window.set_busy(True)
+        assert not window.model_enabled_checkbox.isEnabled()
+        assert not window.model_path_edit.isEnabled()
+        window.set_busy(False)
+        window.model_enabled_checkbox.setChecked(False)
+        assert not window.model_path_edit.isEnabled()
         assert not window.recording_checkbox.isChecked()
         assert not window.replay_index_spin.isEnabled()
         assert all(not checkbox.isChecked() for checkbox in window.stage_checkboxes.values())
@@ -50,6 +107,7 @@ def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None
 
         window.set_session(SessionInfo(2, 10.0, ["C3", "C4"]))
         assert "C3, C4" in window.session_info.toPlainText()
+        assert window.available_model_channels_label.text() == "C3, C4"
         assert not window._has_displayed_block
 
         block = DataBlock(

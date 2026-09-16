@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
@@ -180,7 +181,7 @@ class MainWindow(QMainWindow):
 
 
         self.processing_status_label = QLabel(
-            "分期状态：模型未接入 · 尚无处理结果"
+            "分期状态：模型默认未启用（NoModel）"
         )
         self.processing_status_label.setObjectName("processingStatus")
         self.processing_status_label.setWordWrap(True)
@@ -192,7 +193,8 @@ class MainWindow(QMainWindow):
 
 
         self.hint_label = QLabel(
-            "模型未接入 · 仅模拟，真实刺激未接入 · EEG 波形请在 Curry 8 查看"
+            "模型默认关闭（NoModel）；ONNX 睡眠分期可在连接前显式启用 · "
+            "仅模拟，真实刺激未接入 · EEG 波形请在 Curry 8 查看"
         )
         self.hint_label.setWordWrap(True)
         self.hint_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -233,6 +235,40 @@ class MainWindow(QMainWindow):
         summary_layout.setColumnStretch(0, 1)
         summary_layout.setColumnStretch(1, 1)
         settings_layout.addWidget(self.summary_section)
+
+        self.model_section = CollapsibleSection("睡眠分期模型")
+        model_layout = QFormLayout(self.model_section.content)
+        self.model_enabled_checkbox = QCheckBox("启用 ONNX 分期（默认关闭）")
+        self.model_enabled_checkbox.setObjectName("modelEnabled")
+        self.model_enabled_checkbox.toggled.connect(self._update_model_controls)
+        model_layout.addRow(self.model_enabled_checkbox)
+        model_path_row = QWidget()
+        model_path_layout = QHBoxLayout(model_path_row)
+        model_path_layout.setContentsMargins(0, 0, 0, 0)
+        self.model_path_edit = QLineEdit()
+        self.model_path_edit.setObjectName("modelPathEdit")
+        self.model_path_edit.setPlaceholderText("启用后显式选择一个 ONNX 模型文件")
+        self.choose_model_button = QPushButton("选择…")
+        self.choose_model_button.setObjectName("chooseOnnxModel")
+        self.choose_model_button.clicked.connect(self._choose_model_path)
+        model_path_layout.addWidget(self.model_path_edit, 1)
+        model_path_layout.addWidget(self.choose_model_button)
+        model_layout.addRow("ONNX 文件", model_path_row)
+        self.model_channel_edit = QLineEdit("Fpz-Cz")
+        self.model_channel_edit.setObjectName("modelChannelEdit")
+        self.model_channel_edit.setPlaceholderText("与 Curry 标签精确匹配，如 Fpz-Cz")
+        model_layout.addRow("单通道标签", self.model_channel_edit)
+        self.available_model_channels_label = QLabel("完成 Curry 握手后显示可用通道")
+        self.available_model_channels_label.setWordWrap(True)
+        model_layout.addRow("可用通道", self.available_model_channels_label)
+        self.model_contract_label = QLabel(
+            "仅勾选启用后才校验或加载模型；失败会明确报错，不回退。"
+            "输入按 µV 处理，50 Hz 工频处理 + 0.3–35 Hz 带通，"
+            "重采样到 100 Hz，不做逐样本 z-score；时间长度由 ONNX 自动读取。"
+        )
+        self.model_contract_label.setWordWrap(True)
+        model_layout.addRow("固定预处理", self.model_contract_label)
+        settings_layout.addWidget(self.model_section)
 
         self.workflow_section = CollapsibleSection("会话记录与离线回放")
         workflow_layout = QVBoxLayout(self.workflow_section.content)
@@ -494,6 +530,31 @@ class MainWindow(QMainWindow):
             "recording_root": self._recording_root,
         }
 
+    def model_configuration(self) -> dict[str, str]:
+        model_path_text = self.model_path_edit.text().strip()
+        channel_name = self.model_channel_edit.text().strip()
+        if not model_path_text:
+            raise ValueError("请选择 ONNX 模型文件")
+        if not channel_name:
+            raise ValueError("请输入一个 Curry 单通道标签")
+        model_path = Path(model_path_text).expanduser().resolve(strict=True)
+        if not model_path.is_file():
+            raise ValueError(f"ONNX 路径不是文件：{model_path}")
+        if model_path.suffix.casefold() != ".onnx":
+            raise ValueError(f"模型文件扩展名必须是 .onnx：{model_path}")
+        return {"model_path": str(model_path), "channel_name": channel_name}
+
+    @Slot()
+    def _choose_model_path(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择睡眠分期 ONNX 模型",
+            self.model_path_edit.text().strip(),
+            "ONNX 模型 (*.onnx);;所有文件 (*)",
+        )
+        if selected:
+            self.model_path_edit.setText(selected)
+
     @property
     def _recording_root(self) -> str | None:
         path = self.recording_root_label.property("path")
@@ -726,7 +787,7 @@ class MainWindow(QMainWindow):
 
     def _format_processing_result(self, result) -> str:
         if result is None:
-            return "分期状态：模型未接入 · 尚无处理结果"
+            return "分期状态：模型默认未启用（NoModel）"
         if isinstance(result, dict):
             model = result.get("model", {})
             status = str(result.get("status", "failed"))
@@ -761,6 +822,8 @@ class MainWindow(QMainWindow):
             detail += f" · {float(elapsed):.2f} ms"
         if model.get("is_test_double"):
             detail += " · 测试替身"
+        elif model.get("model_id") and model.get("model_id") != "none":
+            detail += f" · {model['model_id']}"
         return (
             f"分期状态：block_id={block_id} · samples [{start}, {end}) · "
             f"{detail}"
@@ -792,6 +855,8 @@ class MainWindow(QMainWindow):
         self._busy = busy
         self.host_edit.setEnabled(not busy)
         self.port_spin.setEnabled(not busy)
+        self.model_enabled_checkbox.setEnabled(not busy and not self._replay_mode)
+        self._update_model_controls()
         self.recording_checkbox.setEnabled(not busy and not self._replay_mode)
         self.choose_recording_dir_button.setEnabled(not busy and not self._replay_mode)
         self._update_button_state()
@@ -836,9 +901,12 @@ class MainWindow(QMainWindow):
         self._replay_mode = active
         self.host_edit.setEnabled(not active and not self._busy)
         self.port_spin.setEnabled(not active and not self._busy)
+        self.model_enabled_checkbox.setEnabled(not active and not self._busy)
+        self._update_model_controls()
         self.recording_checkbox.setEnabled(not active and not self._busy)
         self.choose_recording_dir_button.setEnabled(not active and not self._busy)
         self._update_stimulation_controls()
+
         if entering:
             self.mode_label.setText("离线回放 · 加载中")
             self.session_id_label.setText("回放会话：加载中")
@@ -871,6 +939,17 @@ class MainWindow(QMainWindow):
             self.replay_status_label.setText(message)
         self._update_button_state()
         self._update_stimulation_controls()
+
+    @Slot()
+    def _update_model_controls(self) -> None:
+        enabled = (
+            self.model_enabled_checkbox.isChecked()
+            and not self._busy
+            and not self._replay_mode
+        )
+        self.model_path_edit.setEnabled(enabled)
+        self.choose_model_button.setEnabled(enabled)
+        self.model_channel_edit.setEnabled(enabled)
 
     def set_replay_ready(self, overview) -> None:
         self.session_id_label.setText(f"回放会话：{overview.session_id}")
@@ -937,12 +1016,15 @@ class MainWindow(QMainWindow):
     def set_session(self, session: SessionInfo | None) -> None:
         if session is None:
             self.session_info.setPlainText("尚未完成 BasicInfo / ChannelInfo 握手")
+            self.available_model_channels_label.setText("完成 Curry 握手后显示可用通道")
             return
+        self.available_model_channels_label.setText(", ".join(session.labels))
         text = (
             f"EEG 通道数：{session.n_channels}\n"
             f"采样率：{session.sample_rate_hz:g} Hz\n"
             f"标签：{', '.join(session.labels)}\n"
             "显示单位：原始值（单位未确认）\n"
+            "模型支路：选中通道按 µV 合同解释\n"
             "EEG 波形在 Curry 8 查看；接收时间不是精确采样时刻"
         )
         self.session_info.setPlainText(text)

@@ -8,6 +8,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from .controller import CurrySessionController
+from .onnx_staging import OnnxSleepStagingAdapter
 from .replay import SessionReplayWorker
 from .rally import LoopbackRallySimulator
 from .staging import ModelAdapter, NoModelAdapter
@@ -37,7 +38,7 @@ def pump_latest(
 
 def build_application(
     *,
-    model_factory: Callable[[], ModelAdapter] = NoModelAdapter,
+    model_factory: Callable[[], ModelAdapter] | None = None,
     simulator_factory: Callable[[], LoopbackRallySimulator] = LoopbackRallySimulator,
     request_timeout_seconds: float = 1.0,
 ) -> tuple[QApplication, MainWindow, CurrySessionController]:
@@ -51,15 +52,35 @@ def build_application(
         simulator_factory=simulator_factory,
     )
     controller = CurrySessionController(
-        model_factory=model_factory,
+        model_factory=(model_factory if model_factory is not None else NoModelAdapter),
         stimulation_runtime=stimulation,
     )
     replay = SessionReplayWorker(window)
     replay_state: dict[str, object] = {"overview": None}
 
-    window.connect_requested.connect(
-        lambda: controller.connect(**window.configuration())
-    )
+    def connect_live_session() -> None:
+        session_model_factory = model_factory
+        if session_model_factory is None:
+            if window.model_enabled_checkbox.isChecked():
+                try:
+                    model_config = window.model_configuration()
+                    session_model_factory = lambda config=model_config: (
+                        OnnxSleepStagingAdapter(
+                            model_path=config["model_path"],
+                            channel_name=config["channel_name"],
+                        )
+                    )
+                except (OSError, TypeError, ValueError) as exc:
+                    window.set_error(f"模型配置无效：{exc}")
+                    return
+            else:
+                session_model_factory = NoModelAdapter
+        controller.connect(
+            **window.configuration(),
+            model_factory=session_model_factory,
+        )
+
+    window.connect_requested.connect(connect_live_session)
     window.disconnect_requested.connect(controller.disconnect)
     window.closing_requested.connect(controller.disconnect)
     window.closing_requested.connect(replay.close)

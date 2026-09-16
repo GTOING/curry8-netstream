@@ -1,1 +1,1 @@
-"""P1 desktop EEG receiver for the sleep staging controller."""
+"""Windows EEG receiver, ONNX sleep staging, and stimulation controller."""

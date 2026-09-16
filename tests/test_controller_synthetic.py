@@ -137,14 +137,27 @@ class SyntheticCurryServer:
                     if header.request == REQUEST_BASIC_INFO:
                         if self.mode == "wait_basic":
                             continue
-                        payload = struct.pack(BASIC_INFO_FORMAT, 24, 2, 10, 4, 1, 1)
+                        if self.mode == "onnx_staging":
+                            payload = struct.pack(
+                                BASIC_INFO_FORMAT, 24, 1, 100, 4, 1, 1
+                            )
+                        else:
+                            payload = struct.pack(
+                                BASIC_INFO_FORMAT, 24, 2, 10, 4, 1, 1
+                            )
                         connection.sendall(
                             data_frame(DATA_INFO, INFO_BASIC_INFO, payload)
                         )
                     elif header.request == REQUEST_CHANNEL_INFO:
                         if self.mode == "wait_channel":
                             continue
-                        payload = channel_record(1, "C3") + channel_record(2, "C4")
+                        if self.mode == "onnx_staging":
+                            payload = channel_record(1, "Fpz-Cz")
+                        else:
+                            payload = (
+                                channel_record(1, "C3")
+                                + channel_record(2, "C4")
+                            )
                         connection.sendall(
                             data_frame(DATA_INFO, INFO_CHANNEL_INFO, payload)
                         )
@@ -154,14 +167,21 @@ class SyntheticCurryServer:
                             return
                     elif header.request == REQUEST_STREAMING_STOP:
                         return
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             # A controller may close the synthetic peer on backlog/validation failure.
             return
         finally:
             self.done.set()
 
     def _block_frame(self, start_sample: int, n_samples: int = 300) -> bytes:
-        values = np.arange(n_samples * 2, dtype="<f4").reshape(n_samples, 2)
+        if self.mode == "onnx_staging":
+            n_samples = 3000
+            timeline = np.arange(n_samples, dtype=np.float32) / 100.0
+            values = (
+                20.0 * np.sin(2.0 * np.pi * 10.0 * timeline)
+            ).astype("<f4")[:, None]
+        else:
+            values = np.arange(n_samples * 2, dtype="<f4").reshape(n_samples, 2)
         return data_frame(
             DATA_EEG,
             DATA_TYPE_FLOAT32,
@@ -200,7 +220,8 @@ class SyntheticCurryServer:
             connection.sendall(self._nonfinite_block_frame())
             return
         first = self._block_frame(self.sample_origin)
-        second = self._block_frame(self.sample_origin + 300)
+        step = 3000 if self.mode == "onnx_staging" else 300
+        second = self._block_frame(self.sample_origin + step)
         if self.mode == "fragmented":
             for part in (first[:7], first[7:20], first[20:53], first[53:]):
                 connection.sendall(part)
@@ -525,12 +546,49 @@ def test_loopback_pipeline_processes_every_accepted_block_independent_of_summary
         assert controller.pipeline_outcome.saved_blocks == 0
 
 
+def test_gui_loopback_runs_packaged_onnx_and_displays_sleep_stage(qapp) -> None:
+    from sleep_stim_controller.app import build_application
+    from sleep_stim_controller.onnx_staging import STAGE_LABELS, default_model_path
+    from sleep_stim_controller.staging import ProcessingStatus
+
+    with SyntheticCurryServer("onnx_staging") as server:
+        application, window, controller = build_application()
+        window.show()
+        try:
+            window.host_edit.setText("127.0.0.1")
+            window.port_spin.setValue(server.port)
+            window.model_path_edit.setText(str(default_model_path()))
+            window.model_enabled_checkbox.setChecked(True)
+            assert window.model_configuration()["channel_name"] == "Fpz-Cz"
+            window.connect_button.click()
+            assert wait_until(
+                qapp,
+                lambda: controller.latest_processing is not None
+                and controller.latest_processing.block_id == 2,
+                timeout=15.0,
+            )
+            assert not window.model_enabled_checkbox.isEnabled()
+            result = controller.latest_processing
+            assert result.status is ProcessingStatus.SUCCESS
+            assert result.stage in STAGE_LABELS
+            assert result.confidence is not None
+            assert result.model.model_id.startswith("onnx-sleep-staging:")
+            assert result.stage in window.processing_status_label.text()
+            assert "confidence=" in window.processing_status_label.text()
+            assert "Fpz-Cz" in window.available_model_channels_label.text()
+            window.disconnect_button.click()
+            assert wait_until(qapp, lambda: controller.resources_released())
+        finally:
+            window.close()
+
+
 def test_loopback_recording_and_window_wired_offline_replay(
     qapp, tmp_path, monkeypatch
 ) -> None:
     import json
 
     from sleep_stim_controller.app import build_application
+    from sleep_stim_controller.staging import NoModelAdapter
 
     selected_replay: dict[str, str] = {}
 
@@ -543,7 +601,7 @@ def test_loopback_recording_and_window_wired_offline_replay(
         "sleep_stim_controller.app.QFileDialog.getExistingDirectory",
         choose_directory,
     )
-    application, window, controller = build_application()
+    application, window, controller = build_application(model_factory=NoModelAdapter)
     window.show()
     try:
         window.choose_recording_dir_button.click()
@@ -567,6 +625,7 @@ def test_loopback_recording_and_window_wired_offline_replay(
         selected_replay["path"] = str(session_path)
         manifest = json.loads((session_path / "manifest.json").read_text("utf-8"))
         assert manifest["status"] == "closed"
+        assert manifest["model"]["model_id"] == "none"
         assert manifest["counts"]["saved_blocks"] == 2
         assert manifest["counts"]["processing_results"] == 2
 
@@ -1047,8 +1106,12 @@ def test_p3_full_live_udp_recording_replay_and_shutdown(qapp, tmp_path, monkeypa
 def test_p3_default_no_model_never_sends_even_with_complete_simulation_config(
     qapp, tmp_path, monkeypatch
 ) -> None:
+    import json
+
     from sleep_stim_controller.app import build_application
+    from sleep_stim_controller.recording import SessionReader
     from sleep_stim_controller.rally import LoopbackRallySimulator
+    from sleep_stim_controller.staging import ProcessingStatus
 
     simulator_holder = {}
 
@@ -1062,6 +1125,10 @@ def test_p3_default_no_model_never_sends_even_with_complete_simulation_config(
     )
     runtime = window._p3_runtime
     try:
+        window.model_path_edit.setText(str(tmp_path / "missing-model.onnx"))
+        assert not window.model_enabled_checkbox.isChecked()
+        window.set_recording_root(str(tmp_path))
+        window.recording_checkbox.setChecked(True)
         configure_p3_window(window, monkeypatch, tmp_path)
         assert not runtime.config.issues()
         window.simulator_start_button.click()
@@ -1078,10 +1145,22 @@ def test_p3_default_no_model_never_sends_even_with_complete_simulation_config(
                 and controller.latest_processing.block_id == 2
                 and "模型未接入" in window.stimulation_recent_label.text(),
             )
+            assert controller.latest_processing.status is ProcessingStatus.UNAVAILABLE
             assert simulator_holder["simulator"].requests == ()
             assert controller.disconnect()
             assert wait_until(qapp, lambda: controller.resources_released())
         assert simulator_holder["simulator"].requests == ()
+        session_path = Path(controller.session_path)
+        manifest = json.loads((session_path / "manifest.json").read_text("utf-8"))
+        assert manifest["status"] == "closed"
+        assert manifest["counts"]["saved_blocks"] == 2
+        reader = SessionReader(session_path)
+        assert not reader.overview.incomplete, reader.overview.issues
+        assert len(reader.entries) == 2
+        assert all(
+            entry.processing_result["status"] == "unavailable"
+            for entry in reader.entries
+        )
     finally:
         if controller.is_busy():
             controller.disconnect()

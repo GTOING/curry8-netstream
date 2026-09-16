@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -34,6 +35,7 @@ class ModelDescriptor:
     version: str
     is_test_double: bool = False
     confidence_meaning: str | None = None
+    configuration: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -41,6 +43,7 @@ class ModelDescriptor:
             "version": self.version,
             "is_test_double": self.is_test_double,
             "confidence_meaning": self.confidence_meaning,
+            "configuration": deepcopy(self.configuration),
         }
 
 
@@ -459,6 +462,9 @@ class ProcessingPipeline:
                 adapter.prepare(self.cancel_predictions)
             except Exception as exc:  # failed preparation is per-block failed
                 prepare_error = f"模型准备失败：{exc}"
+            descriptor = adapter.descriptor
+            if writer is not None:
+                writer.set_model(descriptor)
             self._signal_ready(None)
             while True:
                 queued_event: _QueuedSessionEvent | None = None
@@ -522,6 +528,7 @@ class ProcessingPipeline:
                         prepare_error,
                     )
                     if writer is not None:
+                        writer.set_model(result.model)
                         writer.save_processing_result(result)
                     self._completed_results += 1
                     in_flight = None
@@ -672,6 +679,7 @@ class ProcessingPipeline:
         if status is not ProcessingStatus.SUCCESS:
             stage = None
             confidence = None
+        descriptor = adapter.descriptor
         return ProcessingResult(
             session_id=context.session_id,
             block_id=context.block_id,

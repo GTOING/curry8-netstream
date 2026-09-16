@@ -27,7 +27,12 @@
 - [P-GUI 合同](../docs/P_GUI_CONTRACT.md)：取消波形显示，重组控制台，后台数据合同保持。
 - [P-GUI 执行 prompt](../docs/tasks/P_GUI_EXECUTION.md)：已实施并通过工程验收。
 
+- [ONNX 睡眠分期合同](../docs/P_MODEL_ONNX_CONTRACT.md)：单通道选择、µV、50 Hz 工频处理、0.3–35 Hz 带通、100 Hz、无逐样本 z-score，以及按模型自动读取时间长度。
+
 ## 完成任务与执行证据
+
+- [ONNX 睡眠分期接入报告](../reports/2026-09-16_ONNX_STAGING_INTEGRATION.md)：真实 ONNX GUI 合成回环、97 项完整回归、wheel 模型打包和 Windows 原生窗口复验通过；未真机。
+- [Windows 安装与回环验证](../reports/2026-09-16_WINDOWS_VERIFICATION.md)：锁定安装、原生窗口、中文/空格路径和关键 TCP/UDP 回环通过；该报告形成时模型仍为 NoModel，后续状态以上一条为准。
 
 - [P-GUI 执行报告](../reports/P_GUI_REPORT.md)
 - [P-GUI 主线程验收](../reports/P_GUI_ACCEPTANCE.md)：去图与控制台整理通过；89 passed 为执行者结果，原生零屏幕限制保留。
