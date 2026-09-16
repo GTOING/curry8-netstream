@@ -6,6 +6,8 @@ P-GUI 已移除实时和回放波形，EEG 请在 Curry 8 查看。控制台保�
 
 ## 开发环境
 
+Windows 可双击根目录 `setup_windows.cmd` 自动配置环境，或运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_windows.ps1`。详见 [Windows 配置说明](docs/WINDOWS_SETUP.md)。
+
 在本目录运行：
 
 ```sh
