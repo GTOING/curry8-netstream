@@ -61,17 +61,20 @@ def build_application(
     def connect_live_session() -> None:
         session_model_factory = model_factory
         if session_model_factory is None:
-            try:
-                model_config = window.model_configuration()
-                session_model_factory = lambda config=model_config: (
-                    OnnxSleepStagingAdapter(
-                        model_path=config["model_path"],
-                        channel_name=config["channel_name"],
+            if window.model_enabled_checkbox.isChecked():
+                try:
+                    model_config = window.model_configuration()
+                    session_model_factory = lambda config=model_config: (
+                        OnnxSleepStagingAdapter(
+                            model_path=config["model_path"],
+                            channel_name=config["channel_name"],
+                        )
                     )
-                )
-            except (OSError, TypeError, ValueError) as exc:
-                window.set_error(f"模型配置无效：{exc}")
-                return
+                except (OSError, TypeError, ValueError) as exc:
+                    window.set_error(f"模型配置无效：{exc}")
+                    return
+            else:
+                session_model_factory = NoModelAdapter
         controller.connect(
             **window.configuration(),
             model_factory=session_model_factory,

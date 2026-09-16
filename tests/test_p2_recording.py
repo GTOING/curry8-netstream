@@ -92,6 +92,42 @@ def test_no_model_is_explicit_and_recording_off_creates_no_files(tmp_path: Path)
     assert list(tmp_path.iterdir()) == []
 
 
+def test_schema_v1_reader_accepts_model_descriptors_without_configuration(
+    tmp_path: Path,
+) -> None:
+    pipeline, _, _, outcomes, finished = start_pipeline(
+        session_id="legacy-model-descriptor",
+        host="127.0.0.1",
+        port=4455,
+        recording_enabled=True,
+        recording_root=tmp_path,
+        model_factory=NoModelAdapter,
+    )
+    assert pipeline.enqueue(make_context("legacy-model-descriptor", 1))
+    pipeline.finish(cancelled=False, error=None)
+    assert finished.wait(2.0)
+
+    session_path = Path(outcomes[0].session_path)
+    manifest_path = session_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["model"].pop("configuration", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    events_path = session_path / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    result_event = next(event for event in events if event["event_type"] == "processing_result")
+    result_event["payload"]["model"].pop("configuration", None)
+    events_path.write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    reader = SessionReader(session_path)
+    assert reader.manifest["schema_version"] == 1
+    assert not reader.overview.incomplete, reader.overview.issues
+    assert reader.entries[0].processing_result["status"] == "unavailable"
+    assert "configuration" not in reader.entries[0].processing_result["model"]
+
+
 def test_injected_model_status_validation_and_raw_block_isolation() -> None:
     class ScriptedAdapter(AdapterBase):
         def __init__(self) -> None:

@@ -35,6 +35,7 @@ EPOCH_SECONDS = 30
 EPOCH_SAMPLES = int(TARGET_SAMPLE_RATE_HZ * EPOCH_SECONDS)
 STAGE_LABELS = ("W", "N1", "N2", "N3", "REM")
 DEFAULT_MODEL_FILENAME = "litesleepnet_edf20_fp32_6000.onnx"
+PREPROCESSING_VERSION = "onnx-eeg-preprocess-v1"
 
 
 def default_model_path() -> Path:
@@ -73,6 +74,10 @@ def build_context_window(
         earliest = prior[0] if prior else current
         prior = [earliest] * (required_previous - len(prior)) + prior
     return np.ascontiguousarray(np.concatenate([*prior, current]), dtype=np.float32)
+
+
+class PreprocessingDiscontinuity(ValueError):
+    """The current epoch starts a new segment after a gap or rate change."""
 
 
 class _SessionInput(Protocol):
@@ -129,6 +134,9 @@ class StreamingEegPreprocessor:
         if not channel:
             raise ValueError("模型通道名不能为空")
         self.channel_name = channel
+        self._resolved_channel: dict[str, object] | None = None
+        self._observed_sample_rate_hz: float | None = None
+        self._notch_applied: bool | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -139,7 +147,43 @@ class StreamingEegPreprocessor:
         self._bandpass_sos: np.ndarray | None = None
         self._bandpass_state: np.ndarray | None = None
 
+    @property
+    def channel_selection_configuration(self) -> dict[str, object]:
+        resolved = self._resolved_channel or {}
+        return {
+            "requested_label": self.channel_name,
+            "match_rule": "trim_whitespace_and_casefold_then_exact_unique_match",
+            "resolved_label": resolved.get("label"),
+            "resolved_index": resolved.get("index"),
+            "resolved_from_block_id": resolved.get("block_id"),
+        }
+
+    @property
+    def configuration(self) -> dict[str, object]:
+        return {
+            "implementation": "StreamingEegPreprocessor",
+            "version": PREPROCESSING_VERSION,
+            "input_units": "µV",
+            "notch": {
+                "frequency_hz": 50.0,
+                "q": 30.0,
+                "applied_to_observed_input": self._notch_applied,
+            },
+            "bandpass": {
+                "family": "Butterworth",
+                "order": 4,
+                "low_hz": 0.3,
+                "high_hz": 35.0,
+                "implementation": "causal_sos_filter_with_continuous_state",
+            },
+            "target_sample_rate_hz": TARGET_SAMPLE_RATE_HZ,
+            "normalization": "none",
+            "first_epoch_padding": "repeat_earliest_available_epoch_in_segment",
+            "observed_source_sample_rate_hz": self._observed_sample_rate_hz,
+        }
+
     def _channel_index(self, block: DataBlock) -> int:
+        self._resolved_channel = None
         wanted = self.channel_name.casefold()
         matches = [
             index
@@ -153,6 +197,10 @@ class StreamingEegPreprocessor:
             )
         if len(matches) != 1:
             raise ValueError(f"模型通道 {self.channel_name!r} 在输入中不唯一")
+        self._resolved_channel = {
+            "label": str(block.labels[matches[0]]),
+            "index": matches[0],
+        }
         return matches[0]
 
     def _prepare_filters(self, source_rate_hz: float, first_value: float) -> None:
@@ -180,12 +228,14 @@ class StreamingEegPreprocessor:
 
     def process(self, context: BlockContext, block: DataBlock) -> np.ndarray:
         source_rate_hz = float(block.sample_rate_hz)
+        self._observed_sample_rate_hz = source_rate_hz
         if self._expected_start_sample is not None and (
             context.start_sample != self._expected_start_sample
         ):
             expected = self._expected_start_sample
             self.reset()
-            raise ValueError(
+            self._notch_applied = None
+            raise PreprocessingDiscontinuity(
                 f"模型预处理检测到 EEG 样本不连续：预期 {expected}，"
                 f"实际 {context.start_sample}；历史已重置"
             )
@@ -197,14 +247,16 @@ class StreamingEegPreprocessor:
         ):
             previous = self._source_rate_hz
             self.reset()
-            raise ValueError(
+            self._notch_applied = None
+            raise PreprocessingDiscontinuity(
                 f"模型预处理期间采样率从 {previous:g} 变为 "
                 f"{source_rate_hz:g} Hz；历史已重置"
             )
 
-        channel = np.asarray(
-            block.data[self._channel_index(block)], dtype=np.float64
-        )
+        channel_index = self._channel_index(block)
+        assert self._resolved_channel is not None
+        self._resolved_channel["block_id"] = context.block_id
+        channel = np.asarray(block.data[channel_index], dtype=np.float64)
         if channel.ndim != 1 or channel.size == 0:
             raise ValueError("模型通道数据必须是一维非空数组")
         expected_source_samples = round(source_rate_hz * EPOCH_SECONDS)
@@ -227,6 +279,7 @@ class StreamingEegPreprocessor:
                 filtered,
                 zi=self._notch_state,
             )
+        self._notch_applied = self._notch_coefficients is not None
         assert self._bandpass_sos is not None
         assert self._bandpass_state is not None
         filtered, self._bandpass_state = sosfilt(
@@ -275,23 +328,55 @@ class OnnxSleepStagingAdapter:
     """CPU ONNX adapter producing W/N1/N2/N3/REM for the current 30-s block."""
 
     def __init__(self, model_path: str | Path, channel_name: str) -> None:
-        self.model_path = Path(model_path).expanduser().resolve(strict=True)
+        requested_path = Path(model_path).expanduser()
+        self._load_error: str | None = None
+        try:
+            self.model_path = requested_path.resolve(strict=True)
+            self.model_sha256: str | None = sha256_file(self.model_path)
+        except (OSError, RuntimeError) as exc:
+            self.model_path = requested_path.resolve(strict=False)
+            self.model_sha256 = None
+            self._load_error = f"无法读取 ONNX 文件 {self.model_path}：{exc}"
         self.channel_name = channel_name.strip()
         if not self.channel_name:
             raise ValueError("模型通道名不能为空")
-        self.model_sha256 = sha256_file(self.model_path)
-        self.descriptor = ModelDescriptor(
-            model_id=f"onnx-sleep-staging:{self.model_path.stem}",
-            version=f"sha256:{self.model_sha256[:16]}",
-            is_test_double=False,
-            confidence_meaning="maximum softmax probability over W/N1/N2/N3/REM",
-        )
+        self._prepare_status = "not_started"
+        self._prepare_error: str | None = None
         self._session = None
         self._input_name: str | None = None
         self._output_name: str | None = None
         self._input_points: int | None = None
         self._history: deque[np.ndarray] = deque()
         self._preprocessor = StreamingEegPreprocessor(self.channel_name)
+
+    @property
+    def descriptor(self) -> ModelDescriptor:
+        digest = self.model_sha256
+        configuration: dict[str, object] = {
+            "model_content_identity": {
+                "algorithm": "sha256",
+                "digest": digest,
+            },
+            "channel_selection": self._preprocessor.channel_selection_configuration,
+            "input_points": self._input_points,
+            "context_epochs": self.context_epochs,
+            "label_mapping": [
+                {"index": index, "label": label}
+                for index, label in enumerate(STAGE_LABELS)
+            ],
+            "preprocessing": self._preprocessor.configuration,
+            "preparation": {
+                "status": self._prepare_status,
+                "error": self._prepare_error,
+            },
+        }
+        return ModelDescriptor(
+            model_id=f"onnx-sleep-staging:{self.model_path.stem}",
+            version=f"sha256:{digest[:16]}" if digest else "unavailable",
+            is_test_double=False,
+            confidence_meaning="maximum softmax probability over W/N1/N2/N3/REM",
+            configuration=configuration,
+        )
 
     @property
     def input_points(self) -> int | None:
@@ -304,30 +389,49 @@ class OnnxSleepStagingAdapter:
         return self._input_points // EPOCH_SAMPLES
 
     def prepare(self, cancel_event: threading.Event) -> None:
-        if cancel_event.is_set():
-            raise PredictionCancelled("模型加载已取消")
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 1
-        options.inter_op_num_threads = 1
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        session = ort.InferenceSession(
-            str(self.model_path),
-            sess_options=options,
-            providers=["CPUExecutionProvider"],
-        )
-        input_name, output_name, input_points = validate_onnx_contract(session)
-        warmup = np.zeros((1, 1, input_points), dtype=np.float32)
-        output = np.asarray(session.run([output_name], {input_name: warmup})[0])
-        if output.shape != (1, len(STAGE_LABELS)) or not np.isfinite(output).all():
-            raise ValueError(
-                "ONNX 预热输出必须是有限的 "
-                f"(1, {len(STAGE_LABELS)})，实际为 {output.shape}"
+        self._prepare_status = "loading"
+        try:
+            if cancel_event.is_set():
+                raise PredictionCancelled("模型加载已取消")
+            if self._load_error is not None:
+                raise OSError(self._load_error)
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 1
+            options.inter_op_num_threads = 1
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            session = ort.InferenceSession(
+                str(self.model_path),
+                sess_options=options,
+                providers=["CPUExecutionProvider"],
             )
-        self._session = session
-        self._input_name = input_name
-        self._output_name = output_name
-        self._input_points = input_points
-        self._history = deque(maxlen=max(0, input_points // EPOCH_SAMPLES - 1))
+            input_name, output_name, input_points = validate_onnx_contract(session)
+            warmup = np.zeros((1, 1, input_points), dtype=np.float32)
+            output = np.asarray(session.run([output_name], {input_name: warmup})[0])
+            if output.shape != (1, len(STAGE_LABELS)) or not np.isfinite(output).all():
+                raise ValueError(
+                    "ONNX 预热输出必须是有限的 "
+                    f"(1, {len(STAGE_LABELS)})，实际为 {output.shape}"
+                )
+            if cancel_event.is_set():
+                raise PredictionCancelled("模型加载已取消")
+            self._session = session
+            self._input_name = input_name
+            self._output_name = output_name
+            self._input_points = input_points
+            self._history = deque(maxlen=max(0, input_points // EPOCH_SAMPLES - 1))
+            self._prepare_status = "prepared"
+            self._prepare_error = None
+        except Exception as exc:
+            self._session = None
+            self._input_name = None
+            self._output_name = None
+            self._input_points = None
+            self._history.clear()
+            self._prepare_status = (
+                "cancelled" if isinstance(exc, PredictionCancelled) else "failed"
+            )
+            self._prepare_error = str(exc)
+            raise
 
     def predict(
         self,
@@ -344,13 +448,18 @@ class OnnxSleepStagingAdapter:
             or self._input_points is None
         ):
             raise RuntimeError("ONNX 模型尚未 prepare")
-        epoch = self._preprocessor.process(block, data)
+        try:
+            epoch = self._preprocessor.process(block, data)
+        except PreprocessingDiscontinuity:
+            self._history.clear()
+            raise
         model_window = build_context_window(
             self._history,
             epoch,
             self._input_points,
         )
         if self._history.maxlen:
+            # Valid EEG context remains useful even if the ONNX run below fails.
             self._history.append(epoch.copy())
         if cancel_event.is_set():
             raise PredictionCancelled("模型预测已取消")

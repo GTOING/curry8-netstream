@@ -548,7 +548,7 @@ def test_loopback_pipeline_processes_every_accepted_block_independent_of_summary
 
 def test_gui_loopback_runs_packaged_onnx_and_displays_sleep_stage(qapp) -> None:
     from sleep_stim_controller.app import build_application
-    from sleep_stim_controller.onnx_staging import STAGE_LABELS
+    from sleep_stim_controller.onnx_staging import STAGE_LABELS, default_model_path
     from sleep_stim_controller.staging import ProcessingStatus
 
     with SyntheticCurryServer("onnx_staging") as server:
@@ -557,6 +557,8 @@ def test_gui_loopback_runs_packaged_onnx_and_displays_sleep_stage(qapp) -> None:
         try:
             window.host_edit.setText("127.0.0.1")
             window.port_spin.setValue(server.port)
+            window.model_path_edit.setText(str(default_model_path()))
+            window.model_enabled_checkbox.setChecked(True)
             assert window.model_configuration()["channel_name"] == "Fpz-Cz"
             window.connect_button.click()
             assert wait_until(
@@ -565,6 +567,7 @@ def test_gui_loopback_runs_packaged_onnx_and_displays_sleep_stage(qapp) -> None:
                 and controller.latest_processing.block_id == 2,
                 timeout=15.0,
             )
+            assert not window.model_enabled_checkbox.isEnabled()
             result = controller.latest_processing
             assert result.status is ProcessingStatus.SUCCESS
             assert result.stage in STAGE_LABELS
@@ -622,6 +625,7 @@ def test_loopback_recording_and_window_wired_offline_replay(
         selected_replay["path"] = str(session_path)
         manifest = json.loads((session_path / "manifest.json").read_text("utf-8"))
         assert manifest["status"] == "closed"
+        assert manifest["model"]["model_id"] == "none"
         assert manifest["counts"]["saved_blocks"] == 2
         assert manifest["counts"]["processing_results"] == 2
 
@@ -1102,9 +1106,12 @@ def test_p3_full_live_udp_recording_replay_and_shutdown(qapp, tmp_path, monkeypa
 def test_p3_default_no_model_never_sends_even_with_complete_simulation_config(
     qapp, tmp_path, monkeypatch
 ) -> None:
+    import json
+
     from sleep_stim_controller.app import build_application
+    from sleep_stim_controller.recording import SessionReader
     from sleep_stim_controller.rally import LoopbackRallySimulator
-    from sleep_stim_controller.staging import NoModelAdapter
+    from sleep_stim_controller.staging import ProcessingStatus
 
     simulator_holder = {}
 
@@ -1114,11 +1121,14 @@ def test_p3_default_no_model_never_sends_even_with_complete_simulation_config(
         return simulator
 
     application, window, controller = build_application(
-        model_factory=NoModelAdapter,
         simulator_factory=simulator_factory
     )
     runtime = window._p3_runtime
     try:
+        window.model_path_edit.setText(str(tmp_path / "missing-model.onnx"))
+        assert not window.model_enabled_checkbox.isChecked()
+        window.set_recording_root(str(tmp_path))
+        window.recording_checkbox.setChecked(True)
         configure_p3_window(window, monkeypatch, tmp_path)
         assert not runtime.config.issues()
         window.simulator_start_button.click()
@@ -1135,10 +1145,22 @@ def test_p3_default_no_model_never_sends_even_with_complete_simulation_config(
                 and controller.latest_processing.block_id == 2
                 and "模型未接入" in window.stimulation_recent_label.text(),
             )
+            assert controller.latest_processing.status is ProcessingStatus.UNAVAILABLE
             assert simulator_holder["simulator"].requests == ()
             assert controller.disconnect()
             assert wait_until(qapp, lambda: controller.resources_released())
         assert simulator_holder["simulator"].requests == ()
+        session_path = Path(controller.session_path)
+        manifest = json.loads((session_path / "manifest.json").read_text("utf-8"))
+        assert manifest["status"] == "closed"
+        assert manifest["counts"]["saved_blocks"] == 2
+        reader = SessionReader(session_path)
+        assert not reader.overview.incomplete, reader.overview.issues
+        assert len(reader.entries) == 2
+        assert all(
+            entry.processing_result["status"] == "unavailable"
+            for entry in reader.entries
+        )
     finally:
         if controller.is_busy():
             controller.disconnect()
