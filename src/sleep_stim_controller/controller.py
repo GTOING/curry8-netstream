@@ -200,6 +200,7 @@ class CurrySessionController(QObject):
         *,
         recording_enabled: bool = False,
         recording_root: str | Path | None = None,
+        model_factory: Callable[[], ModelAdapter] | None = None,
     ) -> bool:
         """Prepare the processing owner, then start networking off the GUI thread."""
         with self._lock:
@@ -264,7 +265,9 @@ class CurrySessionController(QObject):
                 port=int(port),
                 recording_enabled=recording_enabled,
                 recording_root=recording_root,
-                model_factory=self._model_factory,
+                model_factory=(
+                    model_factory if model_factory is not None else self._model_factory
+                ),
                 pending_limit=self._pending_block_limit,
                 on_ready=lambda error: self._pipeline_ready_signal.emit(
                     generation, error

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "model_id": "litesleepnet-edf20-fp32-6000",
+  "source": "LiteSleepNet/artifacts/onnx/benchmarks/edf20/model_fp32_6000.onnx",
+  "sha256": "E256DEF7BA8454314D8D53B5FF2DB5680CFE5237088A19A2FE59052C20ACF943",
+  "input": {
+    "name": "input",
+    "dtype": "float32",
+    "shape": ["batch_size", 1, 6000],
+    "sample_rate_hz": 100,
+    "units": "uV",
+    "epoch_seconds": 30,
+    "context": "previous_then_current",
+    "first_epoch_policy": "repeat_earliest",
+    "zscore": false,
+    "notch_hz": 50,
+    "bandpass_hz": [0.3, 35.0]
+  },
+  "output": {
+    "name": "output",
+    "dtype": "float32",
+    "shape": ["batch_size", 5],
+    "labels": ["W", "N1", "N2", "N3", "REM"],
+    "confidence": "maximum_softmax_probability"
+  }
+}

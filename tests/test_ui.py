@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QGraphicsView, QSplitter
 
 from curry_netstream.models import DataBlock, SessionInfo
 from sleep_stim_controller.ui import MainWindow
+
+
+def test_model_configuration_rejects_missing_or_wrong_extension(qapp, tmp_path) -> None:
+    window = MainWindow()
+    try:
+        window.model_path_edit.setText(str(tmp_path / "missing.onnx"))
+        with pytest.raises(FileNotFoundError):
+            window.model_configuration()
+        text_file = tmp_path / "model.txt"
+        text_file.write_text("not an ONNX model", encoding="utf-8")
+        window.model_path_edit.setText(str(text_file))
+        with pytest.raises(ValueError, match=".onnx"):
+            window.model_configuration()
+    finally:
+        window.close()
 
 
 def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None:
@@ -17,8 +33,11 @@ def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None
         assert window.port_spin.value() == 4455
         assert not window.findChildren(QGraphicsView)
         assert not window.findChildren(QSplitter)
-        assert "模型未接入" in window.hint_label.text()
+        assert "ONNX 睡眠分期" in window.hint_label.text()
         assert "真实刺激未接入" in window.hint_label.text()
+        model_config = window.model_configuration()
+        assert model_config["model_path"].endswith("litesleepnet_edf20_fp32_6000.onnx")
+        assert model_config["channel_name"] == "Fpz-Cz"
         assert not window.recording_checkbox.isChecked()
         assert not window.replay_index_spin.isEnabled()
         assert all(not checkbox.isChecked() for checkbox in window.stage_checkboxes.values())
@@ -50,6 +69,7 @@ def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None
 
         window.set_session(SessionInfo(2, 10.0, ["C3", "C4"]))
         assert "C3, C4" in window.session_info.toPlainText()
+        assert window.available_model_channels_label.text() == "C3, C4"
         assert not window._has_displayed_block
 
         block = DataBlock(
