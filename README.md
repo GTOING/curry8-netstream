@@ -1,164 +1,96 @@
-# Curry 8 NetStreaming EEG 客户端
+# 睡眠分期电刺激控制器
 
-通过 Curry 8 的 NetStreaming TCP/IP 接口完成自动握手，并把每个未压缩
-EEG 数据包解码为 NumPy 数组：
+P-GUI 已移除实时和回放波形，EEG 请在 Curry 8 查看。控制台保留完整 EEG 接收、校验、分期接口、保存和逐块只读回放。原生桌面仍待验证：P4-A 曾退出 139，本轮去图后在当前 shell 退出 134 并报“无可用屏幕”；离屏通过不代表原生窗口通过。
+
+当前已完成 P1/P2 桌面、Curry 脑电接入、分期接口、可选会话记录和只读离线回放，并实现 P3 睡眠期策略、协议适配及受控本机 UDP 模拟联调。正式模型、真实电刺激、真实 Rally 设备及跨设备时钟同步仍未接入；NoModel 时每块显示 `unavailable`，不会默认生成 W/N1/N2/N3/REM 结果或发送 UDP 请求。
+
+## 开发环境
+
+在本目录运行：
+
+```sh
+uv sync --locked
+source .venv/bin/activate
+```
+
+Python 使用 3.11，依赖和开发工具由 `pyproject.toml` 声明，具体版本由 `uv.lock` 固定。正式部署目标为 Windows，模型接入暂缓；当前 Windows 原生与真机验证尚未完成。日常同步使用 `--locked`，有意修改依赖时再更新锁文件。
+
+Curry 以本地可编辑依赖安装，当前适配源码随项目保存在 `curry8-netstream/`。从 GitHub 克隆本项目后，在仓库根目录执行 `uv sync --locked` 即可，无需再次克隆 Curry 或应用补丁。`patches/` 保留适配来源说明，当前源码已包含这些改动。
+
+## 目录职责
 
 ```text
-shape = [EEG 通道数, 每通道采样点数]
+sleep/
+  AGENTS.md                    主线程与执行线程规则
+  README.md                    项目入口
+  pyproject.toml               包配置、依赖、测试发现配置
+  uv.lock                      依赖锁文件
+  .python-version              Python 版本选择
+  .gitignore                   本地环境、原件和运行产物排除项
+  src/sleep_stim_controller/    控制器、分期流水线、v1 会话读写/回放、P3 策略/本机模拟与 GUI
+  curry8-netstream/             随项目发布的 Curry 通信本地依赖
+  docs/                        需求与后续接口合同
+  decision_records/            当前队列、决策及计划
+  reports/                     阅读、验收与执行证据
+  reference/                   原始参考材料及来源索引
+  .venv/                       uv 管理的本地环境
 ```
 
-如果 Curry 每 30 秒发送一个数据包，采样率为 `fs`，则正常输出应满足：
+根级 `tests/` 包含控制器、分期/会话格式、离屏 UI 和本机回环合成 Curry 服务测试；`curry8-netstream/` 保存 Curry 依赖源码和测试，不将参考 Demo 当作产品代码。
 
-```text
-每通道采样点数 = fs × 30
+## 当前可用验证入口
+
+```sh
+uv run --locked python -c 'import sleep_stim_controller, curry_netstream, PySide6'
+uv run --locked pytest
 ```
 
-## 当前进度（2026-09-15）
+启动桌面程序：
 
-当前目标只包括“稳定接收并完整解码每个 30 秒 EEG 数据包”，暂不包括
-睡眠分期模型、信号预处理和结果回传。
-
-| 环节 | 状态 | 说明 |
-|---|---|---|
-| 参考协议筛选 | 已完成 | 已从约 2.54 GB 旧工程中保留 3 个 Curry 协议相关文件 |
-| 20 字节消息头 | 已完成 | 大端 `>4sHHIII`，并有真实 CTRL 抓包回归测试 |
-| 自动握手 | 已完成 | BasicInfo → ChannelInfo → StreamingStart |
-| 基础/通道信息 | 已完成 | 解析通道数、采样率、数据大小及 UTF-16LE 标签 |
-| EEG payload 解码 | 已完成 | 未压缩小端 float32，输出 `[channel, sample]` |
-| TCP 完整收包 | 已完成 | 支持断包、跨超时保留、payload 上限保护 |
-| 连续性与 30 秒检查 | 已完成 | 检查 `start_sample` 连续性和每包持续时间 |
-| 自动化测试 | 已完成 | 11 项测试全部通过，含完整 30 秒合成数据块 |
-| Curry 8 真机验证 | 待完成 | 需要连接目标设备获取至少两个真实 EEG 包 |
-
-代码功能已经实现，当前唯一关键缺口是目标 Curry 8 的真实网络数据。真机测试
-通过前，不能把“参考协议和合成测试通过”等同于“目标设备已验证”。
-
-## 协议依据与当前边界
-
-协议实现已根据本地 `reference/curry_netstream_protocol/` 中的 Curry Python
-参考客户端完成。当前仅保留：
-
-```text
-reference/curry_netstream_protocol/
-  currydefs.py       包头、消息码和协议结构体
-  currystreaming.py  自动握手、DATA 分发和 EEG 排列
-  tcpclient.py       TCP 接收与缓存参考
+```sh
+uv run --locked sleep-stim-controller
 ```
 
-`reference/` 只用于本机分析，已由 `.gitignore` 排除，不会提交。重复副本、
-旧 C++ COM 工程、离线 MATLAB、GUI、音频及编译产物已移入
-`trash/reference_unrelated_2026-09-15/`，同样不会提交；由使用者手动清理。
+窗口默认使用 `127.0.0.1:4455`，连接期间地址和端口不可修改。默认窗口 1000×720，最小 800×600；顶部固定连接、模式和错误区域，主体依次展示数据/分期摘要、刺激配置、会话记录/回放。连接参数、会话详情和诊断可折叠；长错误、方案和路径可滚动阅读与复制。摘要显示实际会话、块和样本区间、通道、采样率，单位保持未确认。模型区域明确显示未接入。
 
-当前已经明确并实现：
+保存默认关闭。需要记录时，在连接前展开“会话记录与离线回放”，选择保存父目录并启用本次记录；启用后每次连接都会创建新的 `session_<唯一标识>/` 目录，现有会话不会覆盖。会话包含 `manifest.json`、`events.jsonl` 和按需读取的 `blocks/*.npy`，保存 Curry 解码后的原始数值，不是 TCP 原始抓包，单位仍为 unknown。退出实时会话后，可选择会话目录打开只读回放并逐块导航；回放不连接 Curry、不重新推理，也不控制设备。未完整关闭、末行截断或缺少处理结果的会话会显式标记为不完整，只提供可验证的记录前缀。
 
-- 20 字节大端消息头：`>4sHHIII`；
-- `CTRL` 与 `DATA` 消息；
-- 基础信息、通道信息、开始/停止推流的请求码；
-- 24 字节小端 `BasicInfoAcq`；
-- 144 字节小端 `NetStreamingChannelInfo`；
-- 未压缩、小端 `float32` EEG；
-- 线上数据为采样点优先交织，输出转为 `[channel, sample]`；
-- TCP 半包跨超时保留，以及最大 payload 长度检查。
+## P3 睡眠期策略与 Rally 本机模拟
 
-仓库尚缺一份真实 Curry EEG 网络抓包，因此解码已经通过合成端到端测试，
-但仍需连接目标 Curry 8 做最终真机验证。压缩的 float32 ZIP 数据暂不支持；
-请将服务器配置为未压缩格式。
+“睡眠期决策与本机模拟”面板默认五期未选、策略/间隔/最大结果年龄未配置、协议未选择、自动决策关闭、模拟端未启动。真实模型尚未接入时，即使手动启用自动决策，NoModel 的 `unavailable` 结果也不会产生候选请求。界面持续标明“仅模拟，真实刺激未接入”。
 
-## 自动握手流程
+本机联调时，先配置一个或多个目标期、明确选择“每个匹配目标期块”或“进入目标期集合”，填写最小请求间隔和最大结果年龄，再选择本地模拟协议 JSON；之后显式启动本应用模拟端并开启自动决策。间隔允许 `0`，结果年龄必须大于 `0`；两者没有预置实验值。模拟通信超时默认 `1` 秒，可调整，它只用于本机联调，不代表真机 SLA。默认模拟器仅绑定 `127.0.0.1` 的随机空闲 UDP 端口，不提供 Rally 地址输入、不使用 `8801`。
 
-正常 `stream()` 会依次执行：
+协议 JSON 顶层字段为：`schema_version`（整数 `1`）、非空 `name` 与 `protocol_version`、非空唯一 `initial_stimulus_channels`、可选 `return_channels`，以及 `payload`。`payload` 只能包含 `SD`、`FR`、`FD`、`CHS`：前三项是秒数，要求 `SD>0`、`FR/FD>=0` 且 `FR+FD<=SD`；`CHS` 是 1–8 个不重复通道对象。通道名 `N` 必须属于显式声明的初始刺激通道，不能是返回通道。`T="tD"` 时字段为 `N,T,A`；`T="tA"` 时字段为 `N,T,A,F,P,D`；`A/D` 单位为 μA，`F` 为 Hz，`P` 为度。所有数值须有限且 JSON 可编码。协议结构校验不等于真机参数合规：总电流阈值、通道上限及真实设备限制仍未核实，不能据此开展真机实验。
 
-```text
-连接 Curry
-  → 请求 BasicInfo（request=6）
-  → 解析 EEG 通道数、采样率和数据大小
-  → 请求 ChannelInfo（request=3）
-  → 解析 UTF-16LE 通道名称
-  → 请求开始推流（request=8）
-  → 接收 DATA_Eeg / Float32（code=2, request=1）
-  → 输出 DataBlock.data[channel, sample]
-  → 结束时请求停止推流（request=9）
+策略只处理当前实时会话中成功且期别合法的模型结果，并逐块记录允许/抑制原因；重复/倒序块、过期结果、间隔或在途占用会抑制请求，不排队补发。用户关闭自动决策只阻止新请求，不代表停止设备。Rally 应答 `RALLY_ERROR_SUCCESS` 只表示接口返回成功，不证明实际刺激发生。
+
+UDP 协议没有请求 ID，因此每个请求使用独立临时来源端口；该端口在本应用模拟端关闭前保持隔离，迟到或重复响应不能匹配到下一条命令。超时、无法解释的响应或 API 拒绝都不会重试；超时/无法关联记为 `unknown`，未知或拒绝会关闭自动决策。若启用 P2 记录，配置快照、决策、`request_sent` 与 `request_outcome` 由 P2 单写者按序追加，且在 `session_finished` 前收口。旧 P1/P2 schema v1 会话格式保持兼容；回放只展示已记录事件，不运行策略、不启动通信。
+
+![P-GUI 控制台默认状态（离屏 1000×720）](reports/P_GUI_DEFAULT.png)
+
+“诊断详情”显示界面摘要替换计数与独立处理队列状态，摘要替换不代表 EEG 丢失。PyQtGraph 及绘图专用数组操作已移除，NumPy 继续用于原始数据处理与保存。处理待办最多等待 4 个块，另有至多 1 个正在处理的块；积压达到上限会终止该次接收并显示错误，不静默丢块。记录关闭时仅保留界面当前显示状态，不创建会话目录或 EEG/结果文件。
+
+离屏验证可使用：
+
+```sh
+QT_QPA_PLATFORM=offscreen uv run --locked pytest
 ```
 
-## 环境
+## 文档入口
 
-依赖 Python 3.10+ 和 NumPy。可以用 Conda 创建环境：
+- [当前任务队列](decision_records/ACTIVE_QUEUE.md)
+- [开发流程规划](decision_records/plans/SLEEP_STIM_DEVELOPMENT_PLAN.md)
+- [用户需求整理](docs/SLEEP_STIM_REQUIREMENTS.md)
+- [资料归档索引](reference/README.md)
+- [参考代码与文档分析](reports/2026-09-15_reference_review.md)
+- [目录整理记录](reports/2026-09-15_development_layout.md)
+- [P4 接入准备操作手册](docs/P4_INTEGRATION_RUNBOOK.md)
+- [P4-A 原生排障报告](reports/P4A_NATIVE_READINESS_REPORT.md)
+- [P-GUI 界面整理报告](reports/P_GUI_REPORT.md)
 
-```powershell
-conda env create -f environment.yml
-conda activate curry8
-```
+## 仓库与材料边界
 
-## 测试
+GitHub 仓库根目录采用当前控制器项目结构，原通信库以 `curry8-netstream/` 本地依赖随项目发布。开发机器上的嵌套 `.git` 元数据不上传。P1 对 Curry 客户端增加可取消接收、状态/会话/错误结果与关闭清理能力，保持原有 CLI 和线协议布局。虚拟环境、缓存、实验数据和被忽略的参考原件不上传。
 
-测试只依赖标准库 `unittest` 和 NumPy，不需要 Curry 硬件：
-
-```powershell
-$env:PYTHONPATH = "src"
-python -m unittest discover -s tests -v
-```
-
-当前 11 项测试全部通过，覆盖真实 CTRL 抓包回归、协议结构尺寸、基础/通道
-信息、交织 EEG 解码、完整 30 秒合成块、自动握手、连续数据包，以及 TCP
-帧头半包后发生超时的恢复。
-
-## 连接 Curry
-
-在 Curry 中启用 NetStreaming Server，使用未压缩 float32 数据格式，然后运行：
-
-```powershell
-python scripts/run_client.py `
-  --host <Curry-IP> `
-  --port 4455 `
-  --max-blocks 2 `
-  --expected-seconds 30 `
-  --dump capture_2blocks.bin `
-  --log-level DEBUG
-```
-
-程序会为每个 EEG 包打印：
-
-```text
-[block 1] start_sample=... shape=(通道数, 采样点数) sr=...Hz duration=30.000s
-```
-
-`--dump` 会保留原始入站字节，便于真机验证失败时复现。用 `--max-blocks 2`
-可以在收到两个 EEG 包后自动请求停止推流并退出。
-
-### 真机验收标准
-
-至少连续收到两个数据包，并同时满足：
-
-1. 每包输出 `duration=30.000s`；
-2. 数组形状为 `(EEG通道数, 采样率 × 30)`；
-3. 通道标签、数量和 Curry 当前配置一致；
-4. 后一包的 `start_sample` 等于前一包起点加前一包采样数；
-5. EEG 数值有限且量级合理，不出现整块 `NaN/Inf` 或明显字节序错误；
-6. `capture_2blocks.bin` 能用于离线复现同样的解码结果。
-
-若输出提示压缩 EEG，请在 Curry NetStreaming Server 中选择未压缩 float32
-格式；当前版本明确拒绝 ZIP payload，避免把压缩字节误解为 EEG。
-
-纯诊断模式不会解析数据：
-
-```powershell
-python scripts/run_client.py --host <Curry-IP> --port 4455 `
-  --peek 70 --dump capture_70s.bin --log-level DEBUG
-```
-
-## 代码结构
-
-```text
-src/curry_netstream/protocol.py  协议常量、结构体和 EEG 解码
-src/curry_netstream/client.py    TCP 连接、自动握手、分帧和分发
-src/curry_netstream/models.py    SessionInfo / DataBlock
-scripts/run_client.py            命令行真机入口
-tests/                            协议及合成端到端测试
-reference/curry_netstream_protocol/ 本地协议参考（已忽略）
-trash/                            待手动清理文件（已忽略）
-```
-
-
-## 睡眠分期电刺激控制器
-
-完整控制器项目位于 [sleep-stim-controller](sleep-stim-controller/README.md)，包括 GUI、分期接口、会话记录/回放、刺激策略及 Rally 本机模拟。正式目标 Windows，真实 Rally/设备及同步尚未联调；模型暂未接入。该目录附带当前 Curry 依赖源码，可从该目录运行 `uv sync --locked`。
+P1 的 `DataBlock` 边界严格拒绝非二维/空数组、通道标签不匹配、非有限值、非正采样率和非 30 秒块；不裁剪、补零、重采样或缩放。合成回环测试不等于 Curry 8 真机验证，需取得目标设备配置后另行完成。依赖 Rally 外部软件的硬件功能尚不可运行，不安装同名 Python 包替代 Rally。
