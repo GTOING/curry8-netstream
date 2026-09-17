@@ -53,6 +53,7 @@ def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None
         assert "ONNX 睡眠分期" in window.hint_label.text()
         assert "模型默认关闭（NoModel）" in window.hint_label.text()
         assert "真实刺激未接入" in window.hint_label.text()
+        assert "当前累计 0.0 / 30 秒" in window.assembly_progress_label.text()
         assert not window.model_enabled_checkbox.isChecked()
         assert not window.model_path_edit.isEnabled()
         assert not window.choose_model_button.isEnabled()
@@ -125,6 +126,57 @@ def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None
         window.mark_session_finished(True, None)
         assert "历史数据" in window.data_status_label.text()
         assert not window.settings_scroll.isAncestorOf(window.error_label)
+    finally:
+        window.close()
+
+
+def test_live_assembly_progress_is_readable_and_replay_does_not_overwrite(qapp):
+    from sleep_stim_controller.epoching import EpochAssemblySnapshot
+
+    window = MainWindow()
+    try:
+        snapshot = EpochAssemblySnapshot(
+            window_seconds=30.0,
+            window_samples=300,
+            received_packets=7,
+            received_samples=512,
+            completed_windows=1,
+            accepted_windows=1,
+            partial_samples=212,
+            partial_start_sample=400,
+        )
+        window.set_state("streaming", "正在接收")
+        window.set_assembly_progress(snapshot)
+        assert "收包 7 个" in window.assembly_progress_label.text()
+        assert "当前累计 21.2 / 30 秒" in window.assembly_progress_label.text()
+        before = window.assembly_progress_label.text()
+        window.set_replay_mode(True, "回放")
+        window.set_assembly_progress(
+            EpochAssemblySnapshot(30.0, 300, 99, 999, 3, 3, 0, None)
+        )
+        assert window.assembly_progress_label.text() != before
+        assert "离线回放" in window.assembly_progress_label.text()
+    finally:
+        window.close()
+
+
+def test_live_session_shows_waiting_until_handshake_and_terminal_copy(qapp) -> None:
+    window = MainWindow()
+    try:
+        window.begin_session()
+        assert "正在连接 Curry" in window.data_status_label.text()
+        assert "已连接" not in window.assembly_progress_label.text()
+
+        window.set_state("connecting", "正在等待握手")
+        assert "等待 BasicInfo / ChannelInfo 握手" in window.data_status_label.text()
+
+        window.set_session(SessionInfo(2, 10.0, ["C3", "C4"]))
+        assert "已连接" in window.data_status_label.text()
+        window.set_state("streaming", "握手完成")
+        assert "已连接" in window.data_status_label.text()
+
+        window.mark_session_finished(True, None)
+        assert "实时会话已停止" in window.data_status_label.text()
     finally:
         window.close()
 

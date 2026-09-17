@@ -177,6 +177,7 @@ class PipelineOutcome:
     cancelled: bool
     error: str | None
     session_path: str | None
+    stream_assembly: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +258,11 @@ class ProcessingPipeline:
         self._completed_results = 0
         self._unprocessed_blocks = 0
         self._session_path: str | None = None
+        self._stream_assembly: dict[str, object] | None = None
+        self._network_handoff_required = False
+        self._network_handoff_received = False
+        self._network_end_cancelled = False
+        self._network_end_error: BaseException | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -410,6 +416,12 @@ class ProcessingPipeline:
         with self._condition:
             self._condition.notify_all()
 
+    def mark_network_started(self) -> None:
+        """Require a network-end handoff before this pipeline can close."""
+        with self._condition:
+            self._network_handoff_required = True
+            self._condition.notify_all()
+
     def finish(
         self,
         *,
@@ -418,11 +430,46 @@ class ProcessingPipeline:
     ) -> None:
         with self._condition:
             self._finish_requested = True
-            self._finish_cancelled = cancelled
-            self._finish_error = error
+            self._finish_cancelled = self._finish_cancelled or cancelled
+            self._finish_error = self._finish_error or error
             if cancelled:
                 self.cancel_predictions.set()
             self._condition.notify_all()
+
+    def set_stream_assembly(self, summary: dict[str, object] | None) -> None:
+        """Freeze network-thread diagnostics for the single session writer."""
+        with self._condition:
+            if not self._network_handoff_received:
+                self._stream_assembly = dict(summary) if summary is not None else None
+            self._condition.notify_all()
+
+    def handoff_network_end(
+        self,
+        summary: dict[str, object] | None,
+        *,
+        cancelled: bool,
+        error: BaseException | None,
+    ) -> bool:
+        """Commit the frozen network result before the single writer closes.
+
+        The network worker calls this directly from its ``finally`` block. A
+        later Qt lifecycle callback may call it again as a safe fallback, but
+        only the first call can publish the summary or end status.
+        """
+        with self._condition:
+            if self._network_handoff_received:
+                return False
+            self._network_handoff_received = True
+            self._stream_assembly = dict(summary) if summary is not None else None
+            self._network_end_cancelled = cancelled
+            self._network_end_error = error
+            self._finish_requested = True
+            self._finish_cancelled = self._finish_cancelled or cancelled
+            self._finish_error = self._finish_error or error
+            if cancelled:
+                self.cancel_predictions.set()
+            self._condition.notify_all()
+            return True
 
     def _signal_ready(self, error: BaseException | None) -> None:
         if self._ready:
@@ -489,6 +536,10 @@ class ProcessingPipeline:
                             self._finish_requested
                             and self._external_work == 0
                             and not self._event_reservations
+                            and (
+                                not self._network_handoff_required
+                                or self._network_handoff_received
+                            )
                         ):
                             context = None
                             break
@@ -499,6 +550,10 @@ class ProcessingPipeline:
                         and queued_event is None
                         and self._external_work == 0
                         and not self._event_reservations
+                        and (
+                            not self._network_handoff_required
+                            or self._network_handoff_received
+                        )
                     )
                     info = self._session_info
                     info_revision = self._session_info_revision
@@ -576,6 +631,15 @@ class ProcessingPipeline:
                     self._unprocessed_blocks += len(self._pending)
                     self._pending.clear()
                     self._session_events.clear()
+                # A processing/recording failure can reach this finally block
+                # before the TCP worker returns. Keep the writer open until
+                # that worker publishes its frozen summary. Controller paths
+                # that never start networking do not set this requirement.
+                while (
+                    self._network_handoff_required
+                    and not self._network_handoff_received
+                ):
+                    self._condition.wait()
                 # A sent request must resolve or become unknown before the
                 # writer is closed, including after an earlier recording error.
                 while self._external_work or self._event_reservations:
@@ -583,9 +647,18 @@ class ProcessingPipeline:
                 accepted = self._accepted_blocks
                 rejected = self._rejected_blocks
                 unprocessed = self._unprocessed_blocks
-                cancelled = self._finish_cancelled
                 finish_error = self._finish_error
+                stream_assembly = (
+                    dict(self._stream_assembly)
+                    if self._stream_assembly is not None
+                    else None
+                )
             final_error = fatal_error or finish_error
+            cancelled = (
+                self._finish_cancelled
+                and fatal_error is None
+                and finish_error is None
+            )
             if writer is not None:
                 try:
                     writer.finish(
@@ -597,6 +670,7 @@ class ProcessingPipeline:
                         rejected_blocks=rejected,
                         completed_results=self._completed_results,
                         unprocessed_blocks=unprocessed,
+                        stream_assembly=stream_assembly,
                     )
                 except Exception as exc:
                     final_error = final_error or exc
@@ -616,6 +690,7 @@ class ProcessingPipeline:
                         cancelled=cancelled,
                         error=str(final_error) if final_error is not None else None,
                         session_path=self._session_path,
+                        stream_assembly=stream_assembly,
                     )
                 )
 

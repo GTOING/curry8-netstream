@@ -26,6 +26,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_windows.
 
 测试结束会恢复原 `QT_QPA_PLATFORM`；配置过程也恢复临时修改的进程环境变量。默认只安装和检查导入，不启动 GUI、不加载模型、不连接 Curry/Rally。安装运行时依赖不等于启用模型，正式默认仍为 NoModel。
 
+## Curry 发送配置
+
+控制器接收端不要求 Curry 的每个 TCP 网络包包含 30 秒数据。Curry 的 `Blocks Per Second`/`Auto` 只决定发送频率；控制器按网络包中的绝对 `start_sample` 和握手采样率累积不重叠的 30 秒分析窗口。保持非压缩 float32 流，首次现场排查建议选择 Raw（Processed Data 可能改变包长或增加延迟），并记录 Curry 版本、通道顺序、采样率、包样本数和发包设置。发包频率与 30 秒分析窗口相互独立，不要为凑窗修改采样率；缺样、重复、乱序、NaN/Inf 或元信息变化会停止本次会话。
+
+配置完成后可先运行本机合成回环（不会连接真实 Curry，也不会发送刺激）：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_windows.ps1 -RunTests
+```
+
+回环测试验证 TCP 分段/粘包、短包跨窗、记录/回放和取消收尾；它不能替代 Windows 上的真实 Curry 验收。
+
 失败时保留项目、缓存与失败环境，退出码为 1；依提示检查网络、写入权限或项目完整性后重新运行。该脚本不安装 Curry/Rally 软件、设备驱动或修改防火墙。
 
 验证限制：脚本在 macOS 工作区生成并进行静态检查，尚未实际执行 Windows 安装流程；此前应用测试结果不代表此脚本已在 Windows 实测。

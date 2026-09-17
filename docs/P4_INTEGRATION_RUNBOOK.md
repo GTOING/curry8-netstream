@@ -10,8 +10,9 @@
 
 | 子系统 | 现有入口 | 已支持 | 当前不能据此推出 |
 | --- | --- | --- | --- |
-| Curry | 主窗口连接配置 → CurrySessionController.connect() → CurryClient.connect()/stream() | 用户配置 IPv4/端口；TCP BasicInfo、ChannelInfo 握手；请求开始推流；解码为 float32、[channel, sample] 的 DataBlock；控制器检查标签、连续性、有限数值和完整 30 秒块 | 不代表连接了真实采集器；不证明硬件配置、数值单位、采样准确度或记录/采集器状态 |
-| 块上下文 | CurrySessionController._accept_block() → BlockContext | block_id、样本范围、接收边界 UTC 与本机 monotonic_ns；session 内样本连续性可检查 | 接收时间不是 EEG 精确采样时刻；不同进程的 monotonic 时钟不能直接比较 |
+| Curry | 主窗口连接配置 → CurrySessionController.connect() → CurryClient.connect()/stream() | 用户配置 IPv4/端口；TCP BasicInfo、ChannelInfo 握手；请求开始推流；解码为 float32、[channel, sample] 的可变长 DataBlock；控制器检查标签、连续性、有限数值，再按采样点组装完整 30 秒窗口 | 不代表连接了真实采集器；不证明硬件配置、数值单位、采样准确度或记录/采集器状态 |
+| 网络包/分析窗口 | validate_stream_block() → ThirtySecondEpochAssembler → `_accept_epoch()` | 包频率只影响累计速度；首包可从非零样本号开始；跨包、跨 TCP 分段、单包多窗均按绝对样本连续拼接；不足 30 秒尾段不入队 | 不补点、不重采样、不按包数切窗；当前实时事件语义未校准，带事件网络包会明确失败 |
+| 块上下文 | CurrySessionController._accept_block() → BlockContext | block_id、样本范围、使窗口完整的最后网络包入口 UTC 与本机 monotonic_ns；session 内样本连续性可检查 | 接收时间不是 EEG 精确采样时刻；不同进程的 monotonic 时钟不能直接比较 |
 | 处理/保存 | ModelAdapter；ProcessingPipeline；SessionWriter/SessionReader | 默认 NoModel；有界顺序处理；记录默认关闭；启用后保存解码原值和关联事件；回放只读 | 不自动推断预处理、通道映射、单位或分期效果；回放不运行模型或通信 |
 | P3 策略/Rally | StimulationRuntime；LoopbackRallySimulator；RallyTransportWorker | 显式配置目标期、策略、间隔、结果年龄及 JSON；仅发往本应用持有的 127.0.0.1 随机端口模拟器；单请求、无自动重试 | 没有真实 Rally 端点、8801 解锁或真实设备控制接口；API 成功不是刺激输出证据 |
 | 时间 | BlockContext 与 ProcessingResult 单调时间、UTC 日志时间及样本索引 | 可描述本进程收到/处理/发送/收到响应的顺序与耗时 | 没有 Curry、模型主机、Rally 和刺激输出之间的时钟映射、硬件事件同步或误差保证 |
@@ -38,8 +39,8 @@ P2 会话中 block_saved 与 processing_result 由单一写者追加；P3 决策
 
 1. 接入前由主线程取得并确认目标 Curry/NetStreaming Server 软硬件版本、目标机器和授权端点、实际会话配置、可用 TCP 地址/端口、采集与数据保存权限，以及经设备资料核实的 EEG 通道标签、顺序、采样率和数值单位。不得套用 fixture 的通道数/采样率，也不得根据 additional_scale 等字段自行推断 μV。
 2. 在约定的本地或隔离环境连接前记录应用、uv/Python/Curry 版本和目标配置。完成 BasicInfo 与 ChannelInfo 握手，逐项核对服务端 EEG 通道数、标签顺序、采样率和批准的配置；不要仅以 TCP connected/streaming 状态当作有数据。
-3. 在新批准的采集任务中，至少观察两个连续完整 30 秒块：记录每块 shape、dtype、start_sample/end_sample_exclusive、labels、sample_rate_hz、接收 UTC/monotonic 时间；检查有限值、每块长度与 30 × 采样率相符、块间样本连续。任何缺口、重复、长度或元信息冲突均停止该次验证并保留错误证据，不裁剪、补零、重采样或静默缩放。
-4. 仅在授权记录时主动开启会话保存并选择新的输出父目录。关闭后用只读 SessionReader 核对 manifest、block_saved、processing_result、样本范围及 units=unknown；保留原始记录，回放不重连设备。
+3. 在新批准的采集任务中，至少观察两个连续完整 30 秒窗口：同时记录实际网络包样本数/起始编号、窗口 shape、dtype、start_sample/end_sample_exclusive、labels、sample_rate_hz、窗口完成时的接收 UTC/monotonic 时间；检查有限值、窗口长度与 30 × 采样率相符、包和窗口连续。任何缺口、重复、乱序、元信息冲突或非有限值均停止该次验证并保留错误证据，不裁剪、补零、重采样或静默缩放。
+4. 仅在授权记录时主动开启会话保存并选择新的输出父目录。关闭后用只读 SessionReader 核对 manifest、block_saved、processing_result、样本范围及 units=unknown，并检查 `session_finished.payload.stream_assembly` 的 `received_packets`、`received_samples`、`completed_windows`、`accepted_windows` 与 `partial_samples`；保留原始记录，回放不重连设备。
 5. 明确 Curry 的开始/停止采集、放大器、录制与本应用停止推流的关系。现有 client.close() 尽力停止本客户端推流并关闭 TCP；这不是设备采集或设备录制停止确认。
 
 ## 可选模型接入（不含模型本体或准确性验收）

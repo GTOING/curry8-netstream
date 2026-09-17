@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from curry_netstream.models import DataBlock, SessionInfo
 
+from .epoching import EpochAssemblySnapshot
 from .staging import STAGES
 from .stimulation import (
     ProtocolScheme,
@@ -117,6 +118,8 @@ class MainWindow(QMainWindow):
         self._has_displayed_block = False
         self._last_block_summary = "尚无有效 EEG 数据块"
         self._last_display_note = ""
+        self._last_assembly_snapshot: EpochAssemblySnapshot | None = None
+        self._handshake_ready = False
         self._session_finished = False
         self._replay_mode = False
         self._replay_worker_busy = False
@@ -179,6 +182,12 @@ class MainWindow(QMainWindow):
         self.block_metadata_label.setObjectName("blockMetadata")
         self.block_metadata_label.setWordWrap(True)
 
+        self.assembly_progress_label = QLabel(
+            "接收进度：尚未完成 Curry 握手；当前累计 0.0 / 30 秒"
+        )
+        self.assembly_progress_label.setObjectName("assemblyProgress")
+        self.assembly_progress_label.setWordWrap(True)
+
 
         self.processing_status_label = QLabel(
             "分期状态：模型默认未启用（NoModel）"
@@ -232,6 +241,7 @@ class MainWindow(QMainWindow):
         summary_layout.addWidget(self.data_status_label, 1, 0)
         summary_layout.addWidget(self.processing_status_label, 1, 1)
         summary_layout.addWidget(self.block_metadata_label, 2, 0, 1, 2)
+        summary_layout.addWidget(self.assembly_progress_label, 3, 0, 1, 2)
         summary_layout.setColumnStretch(0, 1)
         summary_layout.setColumnStretch(1, 1)
         settings_layout.addWidget(self.summary_section)
@@ -512,7 +522,8 @@ class MainWindow(QMainWindow):
             label.setWordWrap(True)
             label.setMinimumWidth(0)
         for label in (self.data_status_label, self.block_metadata_label,
-                      self.processing_status_label, self.recording_root_label,
+                      self.assembly_progress_label, self.processing_status_label,
+                      self.recording_root_label,
                       self.protocol_summary_label, self.stimulation_recent_label,
                       self.error_label, self.session_id_label, self.replay_status_label):
             label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -848,6 +859,27 @@ class MainWindow(QMainWindow):
         self.state_label.setText(f"状态：{state_text} · {detail}")
         self.status_summary.setText(f"{state_text} · {detail}")
         self.statusBar().showMessage(f"{state_text} · {detail}")
+        if not self._replay_mode and not self._session_finished and not self._has_displayed_block:
+            if state == "connecting" and not self._handshake_ready:
+                self.data_status_label.setText(
+                    "数据状态：正在连接 Curry，等待 BasicInfo / ChannelInfo 握手"
+                )
+                self.assembly_progress_label.setText(
+                    "接收进度：正在连接/等待握手；尚未收到合法网络包"
+                )
+            elif state == "streaming" and self._handshake_ready:
+                self.data_status_label.setText(
+                    "数据状态：已连接；正在接收短包并按采样点累积分析窗口"
+                )
+                if self._last_assembly_snapshot is None:
+                    self.assembly_progress_label.setText(
+                        "接收进度：已连接；收包 0 个 · 完整窗口 0 个 · "
+                        "当前累计 0.0 / 30 秒"
+                    )
+            elif state == "stopping":
+                self.data_status_label.setText("数据状态：正在停止实时会话")
+            elif state == "error":
+                self.data_status_label.setText("数据状态：连接/会话失败，正在收尾")
         self._update_button_state()
 
     @Slot(bool)
@@ -915,14 +947,18 @@ class MainWindow(QMainWindow):
             self._has_displayed_block = False
             self._session_finished = False
             self._last_display_note = ""
+            self._last_assembly_snapshot = None
+            self._handshake_ready = False
             self._p3_session_id = None
             self._p3_replay_events = ()
             self._p3_recent.clear()
             self.stimulation_recent_label.setText("此回放块尚无已记录的刺激事件")
             self.block_metadata_label.setText("等待离线回放数据块")
+            self.assembly_progress_label.setText("接收进度：离线回放不显示实时累积进度")
             self.data_status_label.setText("数据状态：正在打开离线回放")
             self.processing_status_label.setText("离线回放：等待已记录分期结果")
         if not active:
+            self._handshake_ready = False
             self.mode_label.setText("历史离线回放" if self._has_displayed_block else "实时 · 未连接")
             if not self._has_displayed_block:
                 self.session_id_label.setText("当前会话：尚未连接")
@@ -934,6 +970,10 @@ class MainWindow(QMainWindow):
             if self._has_displayed_block:
                 self.data_status_label.setText(
                     "数据状态：历史离线回放数据（回放已退出）"
+                )
+            else:
+                self.assembly_progress_label.setText(
+                    "接收进度：尚未连接；当前累计 0.0 / 30 秒"
                 )
         elif message:
             self.replay_status_label.setText(message)
@@ -1013,11 +1053,33 @@ class MainWindow(QMainWindow):
         self.details.setPlainText(text)
 
     @Slot(object)
+    def set_assembly_progress(self, snapshot: EpochAssemblySnapshot) -> None:
+        """Render throttled live progress without allowing replay overwrite."""
+        if self._replay_mode or self._session_finished:
+            return
+        if not isinstance(snapshot, EpochAssemblySnapshot):
+            return
+        self._last_assembly_snapshot = snapshot
+        self.assembly_progress_label.setText(
+            f"接收进度：收包 {snapshot.received_packets} 个 · "
+            f"样本 {snapshot.received_samples} 点 · "
+            f"完整窗口 {snapshot.completed_windows} 个（已接纳 "
+            f"{snapshot.accepted_windows} 个）· 当前累计 "
+            f"{snapshot.pending_seconds:.1f} / {snapshot.window_seconds:g} 秒"
+        )
+        if not self._has_displayed_block and self._handshake_ready:
+            self.data_status_label.setText(
+                "数据状态：已连接；正在接收短包并按采样点累积分析窗口"
+            )
+
+    @Slot(object)
     def set_session(self, session: SessionInfo | None) -> None:
         if session is None:
+            self._handshake_ready = False
             self.session_info.setPlainText("尚未完成 BasicInfo / ChannelInfo 握手")
             self.available_model_channels_label.setText("完成 Curry 握手后显示可用通道")
             return
+        self._handshake_ready = True
         self.available_model_channels_label.setText(", ".join(session.labels))
         text = (
             f"EEG 通道数：{session.n_channels}\n"
@@ -1028,13 +1090,22 @@ class MainWindow(QMainWindow):
             "EEG 波形在 Curry 8 查看；接收时间不是精确采样时刻"
         )
         self.session_info.setPlainText(text)
+        if not self._replay_mode and not self._session_finished and not self._has_displayed_block:
+            self.data_status_label.setText(
+                "数据状态：已连接；正在接收短包并按采样点累积分析窗口"
+            )
 
     @Slot()
     def begin_session(self) -> None:
         self.set_error("")
         self._session_finished = False
-        self.mode_label.setText("实时 · 等待数据")
-        self.clear_block_summary("本次会话等待首个有效 30 秒块")
+        self._last_assembly_snapshot = None
+        self._handshake_ready = False
+        self.mode_label.setText("实时 · 正在连接")
+        self.clear_block_summary("正在连接 Curry，等待 BasicInfo / ChannelInfo 握手")
+        self.assembly_progress_label.setText(
+            "接收进度：正在连接/等待握手；尚未收到合法网络包"
+        )
 
     @Slot(object, int, int, bool, object)
     def show_block(
@@ -1102,6 +1173,16 @@ class MainWindow(QMainWindow):
     def mark_session_finished(self, cancelled: bool, error: BaseException | None) -> None:
         self._session_finished = True
         self.mode_label.setText("历史 · 会话已结束")
+        if self._last_assembly_snapshot is not None:
+            snapshot = self._last_assembly_snapshot
+            tail = (
+                f" · 尾段 {snapshot.partial_samples} 点未用于分期"
+                if snapshot.partial_samples
+                else " · 无未完成尾段"
+            )
+            self.assembly_progress_label.setText(
+                self.assembly_progress_label.text() + " · 会话结束" + tail
+            )
         if self._has_displayed_block:
             if cancelled:
                 reason = "用户主动断开"
@@ -1113,7 +1194,15 @@ class MainWindow(QMainWindow):
                 f"数据状态：历史数据 · {self._last_block_summary} · {reason}"
             )
         elif error is not None:
-            self.data_status_label.setText(f"数据状态：未收到有效 30 秒块 · {error}")
+            self.data_status_label.setText(f"数据状态：未收到完整 30 秒窗口 · {error}")
+        elif cancelled:
+            self.data_status_label.setText(
+                "数据状态：实时会话已停止 · 未收到完整 30 秒窗口"
+            )
+        else:
+            self.data_status_label.setText(
+                "数据状态：实时会话已结束 · 未收到完整 30 秒窗口"
+            )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
         if not self._p3_close_requested:

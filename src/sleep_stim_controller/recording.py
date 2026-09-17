@@ -211,16 +211,24 @@ class SessionWriter:
         rejected_blocks: int,
         completed_results: int,
         unprocessed_blocks: int,
+        stream_assembly: dict[str, object] | None = None,
     ) -> None:
         if status not in {"closed", "failed"}:
             raise ValueError(f"unsupported final session status: {status}")
+        finish_payload: dict[str, object] = {"status": status, "reason": reason}
+        if stream_assembly is not None:
+            try:
+                json.dumps(stream_assembly, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"stream_assembly 摘要不可序列化：{exc}") from exc
+            finish_payload["stream_assembly"] = dict(stream_assembly)
         try:
             self._append_event(
                 "session_finished",
                 block_id=None,
                 utc_timestamp=utc_now_iso(),
                 monotonic_ns=None,
-                payload={"status": status, "reason": reason},
+                payload=finish_payload,
             )
             self._events.flush()
         finally:
@@ -331,6 +339,7 @@ class SessionReader:
         if manifest.get("source") != "live" or manifest.get("recording_enabled") is not True:
             raise SessionFormatError("manifest 来源或 recording_enabled 标记无效")
         self.manifest = manifest
+        self.session_finished_payload: dict[str, Any] | None = None
         self.issues: list[str] = []
         self.incomplete = manifest.get("status") == "recording"
         if manifest.get("status") not in {"recording", "closed", "failed"}:
@@ -699,6 +708,7 @@ class SessionReader:
             if counts.get("processing_results") != len(results):
                 self.incomplete = True
                 self.issues.append("manifest processing_results 计数与事件索引不一致")
+        self.session_finished_payload = finish_payload
         return tuple(entries)
 
     def _entry_from_event(

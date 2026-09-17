@@ -96,6 +96,7 @@ def build_application(
     controller.session_started.connect(begin_live_session)
     controller.session_finished.connect(window.mark_session_finished)
     controller.diagnostics_changed.connect(window.set_diagnostics)
+    controller.assembly_progress_changed.connect(window.set_assembly_progress)
     controller.processing_changed.connect(window.set_processing_result)
     controller.recording_changed.connect(window.set_recording_status)
     stimulation.simulator_status_changed.connect(window.set_simulator_status)

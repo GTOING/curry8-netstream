@@ -163,7 +163,7 @@ class SyntheticCurryServer:
                         )
                     elif header.request == REQUEST_STREAMING_START:
                         self._send_stream(connection)
-                        if self.mode == "eof":
+                        if self.mode in {"eof", "short_packets_eof"}:
                             return
                     elif header.request == REQUEST_STREAMING_STOP:
                         return
@@ -181,7 +181,10 @@ class SyntheticCurryServer:
                 20.0 * np.sin(2.0 * np.pi * 10.0 * timeline)
             ).astype("<f4")[:, None]
         else:
-            values = np.arange(n_samples * 2, dtype="<f4").reshape(n_samples, 2)
+            values = (
+                np.arange(n_samples * 2, dtype="<f4").reshape(n_samples, 2)
+                + start_sample * 2
+            )
         return data_frame(
             DATA_EEG,
             DATA_TYPE_FLOAT32,
@@ -212,9 +215,7 @@ class SyntheticCurryServer:
             self.partial_sent.set()
             return
         if self.mode == "invalid":
-            connection.sendall(
-                self._block_frame(self.sample_origin, n_samples=299)
-            )
+            connection.sendall(self._block_frame(self.sample_origin, n_samples=0))
             return
         if self.mode == "nonfinite":
             connection.sendall(self._nonfinite_block_frame())
@@ -240,6 +241,19 @@ class SyntheticCurryServer:
                     self._block_frame(self.sample_origin + 300 * index)
                 )
             return
+        if self.mode in {"short_packets", "short_packets_eof", "short_packets_hold"}:
+            packet_sizes = [73, 227, 111, 189, 200]
+            frames = []
+            start = self.sample_origin
+            for packet_size in packet_sizes:
+                frames.append(self._block_frame(start, n_samples=packet_size))
+                start += packet_size
+            joined = b"".join(frames)
+            # Exercise the Curry client's frame reassembly while each decoded
+            # DataBlock remains a deliberately short transport packet.
+            for offset in range(0, len(joined), 97):
+                connection.sendall(joined[offset : offset + 97])
+            return
         connection.sendall(first)
         connection.sendall(second)
 
@@ -251,6 +265,17 @@ def wait_until(qapp, predicate: Callable[[], bool], timeout: float = 5.0) -> boo
         if predicate():
             return True
         time.sleep(0.01)
+    qapp.processEvents()
+    return predicate()
+
+
+def pump_until(qapp, predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    """Drive queued Qt callbacks while a worker-side Event controls progress."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
     qapp.processEvents()
     return predicate()
 
@@ -294,6 +319,110 @@ def test_fragmented_header_and_payload_survive_receive_timeouts() -> None:
             client.close()
 
 
+def test_short_curry_packets_are_assembled_into_windows_and_recorded(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    """Exercise real TCP framing plus sample-point window assembly."""
+    import json
+
+    from sleep_stim_controller.recording import SessionReader
+
+    utc_values = iter(f"packet-{index}" for index in range(1, 10))
+    mono_values = iter(range(1001, 1010))
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "sleep_stim_controller.controller.utc_now_iso",
+        lambda: next(utc_values),
+    )
+    monkeypatch.setattr(
+        "sleep_stim_controller.controller.time",
+        SimpleNamespace(monotonic_ns=lambda: next(mono_values)),
+    )
+    results = []
+    with SyntheticCurryServer("short_packets", sample_origin=100) as server:
+        controller = CurrySessionController()
+        controller.processing_changed.connect(
+            lambda result: results.append(result) if result is not None else None
+        )
+        assert controller.connect(
+            "127.0.0.1",
+            server.port,
+            recording_enabled=True,
+            recording_root=tmp_path,
+        )
+        assert wait_until(
+            qapp,
+            lambda: controller.assembly_snapshot is not None
+            and controller.assembly_snapshot.completed_windows == 2
+            and controller.assembly_snapshot.partial_samples == 200,
+        )
+        assert wait_until(qapp, lambda: len(results) == 2)
+        snapshot = controller.assembly_snapshot
+        assert snapshot is not None
+        assert snapshot.received_packets == 5
+        assert snapshot.received_samples == 800
+        assert snapshot.completed_windows == 2
+        assert snapshot.accepted_windows == 2
+        assert snapshot.partial_start_sample == 700
+        assert [result.start_sample for result in results] == [100, 400]
+        assert controller.state is ConnectionState.STREAMING
+
+        assert controller.disconnect()
+        assert wait_until(qapp, lambda: controller.resources_released())
+
+    session_path = Path(controller.session_path)
+    reader = SessionReader(session_path)
+    assert [entry.start_sample for entry in reader.entries] == [100, 400]
+    expected = np.arange(2 * 800, dtype=np.float32).reshape(800, 2) + 200
+    first, _ = reader.read_block(0)
+    second, _ = reader.read_block(1)
+    np.testing.assert_array_equal(first.data, expected[:300].T)
+    np.testing.assert_array_equal(second.data, expected[300:600].T)
+    assert reader.session_finished_payload is not None
+    assert reader.session_finished_payload["stream_assembly"] == {
+        "window_seconds": 30.0,
+        "window_samples": 300,
+        "received_packets": 5,
+        "received_samples": 800,
+        "completed_windows": 2,
+        "accepted_windows": 2,
+        "partial_samples": 200,
+        "partial_start_sample": 700,
+    }
+    events = [
+        json.loads(line)
+        for line in (session_path / "events.jsonl").read_text("utf-8").splitlines()
+    ]
+    block_events = [event for event in events if event["event_type"] == "block_saved"]
+    assert [event["payload"]["received_utc"] for event in block_events] == [
+        "packet-2",
+        "packet-4",
+    ]
+    assert [event["payload"]["received_monotonic_ns"] for event in block_events] == [
+        1002,
+        1004,
+    ]
+
+
+def test_short_packet_progress_is_not_emitted_once_per_packet(qapp) -> None:
+    progress = []
+    with SyntheticCurryServer("short_packets") as server:
+        controller = CurrySessionController()
+        controller.assembly_progress_changed.connect(progress.append)
+        assert controller.connect("127.0.0.1", server.port)
+        assert wait_until(
+            qapp,
+            lambda: controller.assembly_snapshot is not None
+            and controller.assembly_snapshot.received_packets == 5,
+        )
+        assert controller.disconnect()
+        assert wait_until(qapp, lambda: controller.resources_released())
+    # One handshake snapshot, a bounded timer flush and the final snapshot are
+    # sufficient; network packet count must not become Qt signal count.
+    assert len(progress) <= 4
+
+
 def test_silent_stream_can_be_cancelled_without_error(qapp) -> None:
     with SyntheticCurryServer("idle") as server:
         controller = CurrySessionController()
@@ -322,7 +451,7 @@ def test_remote_eof_and_invalid_block_are_visible_errors(qapp) -> None:
         controller.error_changed.connect(errors.append)
         assert controller.connect("127.0.0.1", server.port)
         assert wait_until(qapp, lambda: controller.state is ConnectionState.ERROR)
-        assert any("30 秒完整块" in error for error in errors)
+        assert any("EEG payload 为空" in error for error in errors)
 
 
 def test_duplicate_connection_is_rejected_and_reconnect_uses_new_session(qapp) -> None:
@@ -489,6 +618,118 @@ def test_reconnect_discards_old_pending_block_and_new_block_is_current(qapp) -> 
             assert wait_until(qapp, lambda: controller.resources_released())
     finally:
         window.close()
+
+
+@pytest.mark.parametrize("first_mode", ["short_packets_eof", "short_packets_hold"])
+def test_partial_tail_isolated_across_eof_cancel_and_reconnect(
+    qapp, first_mode: str
+) -> None:
+    controller = CurrySessionController()
+    try:
+        with SyntheticCurryServer(first_mode) as first:
+            assert controller.connect("127.0.0.1", first.port)
+            assert pump_until(
+                qapp,
+                lambda: (
+                    controller.assembly_snapshot is not None
+                    and controller.assembly_snapshot.completed_windows == 2
+                    and controller.assembly_snapshot.partial_samples == 200
+                ),
+            )
+            if first_mode == "short_packets_eof":
+                assert pump_until(
+                    qapp,
+                    lambda: controller.resources_released() and first.done.is_set(),
+                )
+                assert controller.state is ConnectionState.ERROR
+            else:
+                assert controller.disconnect()
+                assert pump_until(
+                    qapp,
+                    lambda: controller.resources_released() and first.done.is_set(),
+                )
+                assert controller.state is ConnectionState.DISCONNECTED
+            first_snapshot = controller.assembly_snapshot
+            assert first_snapshot is not None
+            assert first_snapshot.partial_start_sample == 700
+
+        with SyntheticCurryServer("short_packets_hold", sample_origin=1000) as second:
+            assert controller.connect("127.0.0.1", second.port)
+            # A new generation starts with no residual assembler state.
+            assert controller.assembly_snapshot is None
+            assert pump_until(
+                qapp,
+                lambda: (
+                    controller.assembly_snapshot is not None
+                    and controller.assembly_snapshot.received_packets == 5
+                ),
+            )
+            snapshot = controller.assembly_snapshot
+            assert snapshot is not None
+            assert snapshot.completed_windows == 2
+            assert snapshot.partial_samples == 200
+            assert snapshot.partial_start_sample == 1600
+            assert controller.disconnect()
+            assert pump_until(qapp, controller.resources_released)
+    finally:
+        if controller.is_busy():
+            controller.disconnect()
+            pump_until(qapp, controller.resources_released)
+
+
+def test_stale_generation_callbacks_cannot_replace_new_assembly_progress(qapp) -> None:
+    controller = CurrySessionController()
+    try:
+        with SyntheticCurryServer("short_packets_hold") as first:
+            assert controller.connect("127.0.0.1", first.port)
+            assert pump_until(
+                qapp,
+                lambda: controller.assembly_snapshot is not None
+                and controller.assembly_snapshot.received_packets == 5,
+            )
+            old_generation = controller._generation
+            old_cancel_event = controller._cancel_event
+            assert controller.disconnect()
+            assert pump_until(qapp, controller.resources_released)
+
+        with SyntheticCurryServer("short_packets_hold", sample_origin=2000) as second:
+            assert controller.connect("127.0.0.1", second.port)
+            assert pump_until(
+                qapp,
+                lambda: controller.assembly_snapshot is not None
+                and controller.assembly_snapshot.received_packets == 5,
+            )
+            before = controller.assembly_snapshot
+            assert before is not None
+
+            # These emulate a late callback from the already-closed first
+            # worker. They must not finalize or replace the second assembler.
+            controller._accept_block(
+                old_generation,
+                old_cancel_event,
+                DataBlock(
+                    data=np.zeros((2, 300), dtype=np.float32),
+                    start_sample=700,
+                    sample_rate_hz=10.0,
+                    labels=["C3", "C4"],
+                ),
+            )
+            controller._on_network_finished(
+                old_generation,
+                True,
+                RuntimeError("late old generation"),
+            )
+            assert controller._finalize_assembly(old_generation) is None
+            qapp.processEvents()
+            after = controller.assembly_snapshot
+            assert after == before
+            assert controller.state is ConnectionState.STREAMING
+            assert controller.disconnect()
+            assert pump_until(qapp, controller.resources_released)
+    finally:
+        if controller.is_busy():
+            controller.disconnect()
+            pump_until(qapp, controller.resources_released)
 
 
 @pytest.mark.parametrize(
@@ -873,6 +1114,11 @@ def test_loopback_slow_processor_overflow_is_visible_and_stops_stream(qapp) -> N
         assert "队列已满" in errors[-1]
         assert controller.pipeline_outcome.rejected_blocks >= 1
         assert controller.pipeline_outcome.accepted_blocks <= 2
+        snapshot = controller.assembly_snapshot
+        assert snapshot is not None
+        assert snapshot.completed_windows >= snapshot.accepted_windows
+        assert snapshot.accepted_windows == controller.pipeline_outcome.accepted_blocks
+        assert controller.pipeline_outcome.stream_assembly == snapshot.to_dict()
         assert server.requests.count(REQUEST_STREAMING_START) == 1
 
 
@@ -916,6 +1162,75 @@ def test_connection_failure_retains_failed_session_and_valid_prefix(qapp, tmp_pa
         assert reader.overview.incomplete
         assert [entry.block_id for entry in reader.entries] == [1, 2]
         assert all(entry.processing_result["status"] == "unavailable" for entry in reader.entries)
+
+
+def test_processing_failure_waits_for_network_handoff_and_finishes_failed_archive(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    import json
+
+    from sleep_stim_controller.recording import SessionReader, SessionWriter
+
+    save_entered = threading.Event()
+    release_failure = threading.Event()
+    original_save = SessionWriter.save_processing_result
+    failed_once = False
+
+    def fail_processing_result(self, result):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            save_entered.set()
+            if not release_failure.wait(2.0):
+                raise OSError("test barrier timeout")
+            raise OSError("injected processing-result failure")
+        return original_save(self, result)
+
+    monkeypatch.setattr(SessionWriter, "save_processing_result", fail_processing_result)
+    controller = CurrySessionController()
+    with SyntheticCurryServer("short_packets_hold") as server:
+        assert controller.connect(
+            "127.0.0.1",
+            server.port,
+            recording_enabled=True,
+            recording_root=tmp_path,
+        )
+        assert pump_until(qapp, save_entered.is_set, timeout=2.0)
+        # The processing worker is held inside save_processing_result while
+        # the TCP peer remains open; the summary cannot have come from the
+        # later Qt lifecycle callback yet.
+        assert not server.done.is_set()
+        assert controller.pipeline_outcome is None
+        release_failure.set()
+        assert pump_until(
+            qapp,
+            lambda: controller.resources_released() and server.done.is_set(),
+        )
+
+    outcome = controller.pipeline_outcome
+    assert outcome is not None
+    assert outcome.error is not None
+    assert "injected processing-result failure" in outcome.error
+    assert outcome.saved_blocks == 1
+    assert outcome.completed_results == 0
+    snapshot = controller.assembly_snapshot
+    assert snapshot is not None
+    assert snapshot.completed_windows == 2
+    assert snapshot.partial_samples == 200
+    assert outcome.stream_assembly == snapshot.to_dict()
+
+    session_path = Path(controller.session_path)
+    reader = SessionReader(session_path)
+    assert reader.session_finished_payload is not None
+    assert reader.session_finished_payload["status"] == "failed"
+    assert reader.session_finished_payload["stream_assembly"] == snapshot.to_dict()
+    journal = [
+        json.loads(line)
+        for line in (session_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert journal[-1]["event_type"] == "session_finished"
+    manifest = json.loads((session_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
 
 
 def configure_p3_window(window, monkeypatch, tmp_path: Path) -> Path:

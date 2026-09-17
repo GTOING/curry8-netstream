@@ -15,6 +15,7 @@ from PySide6.QtCore import QTimer, QObject, Signal, Slot
 from curry_netstream.client import CurryClient, CurryClientCancelled, StreamResult
 from curry_netstream.models import DataBlock, SessionInfo
 
+from .epoching import EpochAssemblySnapshot, ThirtySecondEpochAssembler
 from .latest import LatestBufferStats, LatestItemBuffer
 from .staging import (
     DEFAULT_PENDING_BLOCK_LIMIT,
@@ -63,6 +64,7 @@ class CurrySessionController(QObject):
     session_started = Signal()
     session_finished = Signal(bool, object)
     diagnostics_changed = Signal(str)
+    assembly_progress_changed = Signal(object)
     processing_changed = Signal(object)
     recording_changed = Signal(str)
 
@@ -92,6 +94,9 @@ class CurrySessionController(QObject):
         self._pending_block_limit = pending_block_limit
         self._stimulation_runtime = stimulation_runtime
         self._session: SessionInfo | None = None
+        self._assembler: ThirtySecondEpochAssembler | None = None
+        self._assembly_snapshot: EpochAssemblySnapshot | None = None
+        self._assembly_progress_dirty = False
         self._session_id: str | None = None
         self._session_path: str | None = None
         self._recording_enabled = False
@@ -111,6 +116,9 @@ class CurrySessionController(QObject):
         self._pipeline_outcome: PipelineOutcome | None = None
         self._fatal_error: BaseException | None = None
         self._replay_active = False
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(200)
+        self._progress_timer.timeout.connect(self._flush_assembly_progress)
 
         self._pipeline_ready_signal.connect(self._on_pipeline_ready)
         self._network_finished_signal.connect(self._on_network_finished)
@@ -152,6 +160,12 @@ class CurrySessionController(QObject):
     def pipeline_outcome(self) -> PipelineOutcome | None:
         with self._lock:
             return self._pipeline_outcome
+
+    @property
+    def assembly_snapshot(self) -> EpochAssemblySnapshot | None:
+        """Return the latest immutable network/window progress snapshot."""
+        with self._lock:
+            return self._assembly_snapshot
 
     def is_busy(self) -> bool:
         with self._lock:
@@ -239,6 +253,9 @@ class CurrySessionController(QObject):
             self._pipeline = None
             self._thread = None
             self._session = None
+            self._assembler = None
+            self._assembly_snapshot = None
+            self._assembly_progress_dirty = False
             self._session_id = session_id
             self._session_path = None
             self._recording_enabled = recording_enabled
@@ -258,6 +275,7 @@ class CurrySessionController(QObject):
             self._pipeline_outcome = None
             self._fatal_error = None
             self._state = ConnectionState.CONNECTING
+            self._progress_timer.start()
 
             pipeline = ProcessingPipeline(
                 session_id=session_id,
@@ -312,8 +330,8 @@ class CurrySessionController(QObject):
         )
         self.diagnostics_changed.emit(
             "本次会话已创建。\n"
-            f"分期/记录队列最多等待 {self._pending_block_limit} 个完整块，"
-            "另有至多一个正在处理的块；界面摘要交接独立且可替换。"
+            f"分期/记录队列最多等待 {self._pending_block_limit} 个完整分析窗口，"
+            "另有至多一个正在处理的窗口；界面摘要交接独立且可替换。"
         )
         pipeline.start()
         return True
@@ -347,6 +365,11 @@ class CurrySessionController(QObject):
         if pipeline is not None:
             pipeline.cancel_active_prediction()
             if not network_started:
+                pipeline.handoff_network_end(
+                    None,
+                    cancelled=True,
+                    error=None,
+                )
                 pipeline.finish(cancelled=True, error=None)
         if client is not None:
             client.cancel()
@@ -392,15 +415,30 @@ class CurrySessionController(QObject):
             session_path = self._session_path
             latest_result = self._latest_processing
             recording_enabled = self._recording_enabled
+            assembly = self._assembly_snapshot
         stats = self._latest.stats()
         lines = [
             f"连接状态：{state}",
-            f"校验通过的完整 EEG 块：{validated}",
-            f"处理队列已接纳：{accepted}",
+            f"校验通过的完整分析窗口：{validated}",
+            f"处理队列已接纳的窗口：{accepted}",
             f"已交付界面摘要：{stats.delivered_count}",
             f"有界摘要交接替换过期更新：{stats.replaced_count}（不代表原始 EEG 丢失）",
             f"当前待展示块：{'有' if stats.pending else '无'}",
         ]
+        if assembly is None:
+            lines.append("Curry 网络包/30 秒窗口：尚未完成握手")
+        else:
+            lines.extend(
+                [
+                    f"已校验网络包：{assembly.received_packets} 个，"
+                    f"{assembly.received_samples} 个样本",
+                    f"完整窗口：{assembly.completed_windows} 个，"
+                    f"已接纳：{assembly.accepted_windows} 个",
+                    f"当前累计：{assembly.partial_samples} 点，"
+                    f"{assembly.pending_seconds:.1f} / "
+                    f"{assembly.window_seconds:g} 秒",
+                ]
+            )
         if pipeline is not None:
             lines.append(
                 f"处理队列待办：{pipeline.pending_count}/{pipeline.pending_limit}"
@@ -436,6 +474,8 @@ class CurrySessionController(QObject):
 
     @Slot(int, object)
     def _on_pipeline_ready(self, generation: int, error: BaseException | None) -> None:
+        network_start_error: BaseException | None = None
+        network_not_started_cancelled = False
         with self._lock:
             if generation != self._generation:
                 return
@@ -456,21 +496,39 @@ class CurrySessionController(QObject):
             elif event is not None and event.is_set():
                 self._network_done = True
                 self._network_cancelled = True
+                network_not_started_cancelled = True
             elif client is not None:
                 worker = threading.Thread(
                     target=self._run_session,
-                    args=(generation, client, event),
+                    args=(generation, client, event, pipeline),
                     name="curry-session-worker",
                     daemon=False,
                 )
                 self._thread = worker
                 self._network_started = True
-                worker.start()
-                return
+                if pipeline is not None:
+                    pipeline.mark_network_started()
+                try:
+                    worker.start()
+                except BaseException as exc:
+                    network_start_error = exc
+                    self._thread = None
+                    self._network_started = False
+                    self._network_done = True
+                    self._network_error = exc
+                else:
+                    return
+        finish_error = error or network_start_error
+        finish_cancelled = network_not_started_cancelled and finish_error is None
         if pipeline is not None:
-            pipeline.finish(cancelled=error is None, error=error)
-        if error is not None:
-            self.error_changed.emit(str(error) or type(error).__name__)
+            pipeline.handoff_network_end(
+                None,
+                cancelled=finish_cancelled,
+                error=finish_error,
+            )
+            pipeline.finish(cancelled=finish_cancelled, error=finish_error)
+        if finish_error is not None:
+            self.error_changed.emit(str(finish_error) or type(finish_error).__name__)
             self.state_changed.emit(
                 ConnectionState.STOPPING.value,
                 "会话初始化失败，正在收尾",
@@ -482,6 +540,7 @@ class CurrySessionController(QObject):
         generation: int,
         client: CurryClient,
         cancel_event: threading.Event | None,
+        pipeline: ProcessingPipeline | None,
     ) -> None:
         error: BaseException | None = None
         cancelled = False
@@ -514,6 +573,13 @@ class CurrySessionController(QObject):
             except (OSError, ValueError) as exc:
                 if not cancelled and error is None:
                     error = exc
+            assembly = self._finalize_assembly(generation)
+            if pipeline is not None:
+                pipeline.handoff_network_end(
+                    assembly.to_dict() if assembly is not None else None,
+                    cancelled=cancelled,
+                    error=error,
+                )
             self._network_finished_signal.emit(generation, cancelled, error)
 
     def _worker_status(self, generation: int, status: str) -> None:
@@ -530,7 +596,7 @@ class CurrySessionController(QObject):
             self._set_worker_state(
                 generation,
                 ConnectionState.STREAMING,
-                "握手完成，已请求推流；等待首个有效 30 秒块",
+                "握手完成，已连接并接收；正在按采样点累积 30 秒窗口",
             )
         elif status == "stopping":
             self._set_worker_state(
@@ -566,11 +632,16 @@ class CurrySessionController(QObject):
         with self._lock:
             if generation != self._generation:
                 return
+            assembler = ThirtySecondEpochAssembler(session)
             self._session = session
+            self._assembler = assembler
+            self._assembly_snapshot = assembler.snapshot()
+            self._assembly_progress_dirty = True
             pipeline = self._pipeline
         if pipeline is not None:
             pipeline.set_session_info(session)
         self.session_changed.emit(session)
+        self.assembly_progress_changed.emit(assembler.snapshot())
         self.diagnostics_changed.emit(self.diagnostics_text())
 
     def _accept_block(
@@ -579,11 +650,55 @@ class CurrySessionController(QObject):
         cancel_event: threading.Event | None,
         block: DataBlock,
     ) -> None:
+        # Capture the packet-arrival boundary before validation, accumulation,
+        # queueing or model work. All windows completed by this packet share
+        # this timestamp, which is the last contributing packet for them.
+        received_utc = utc_now_iso()
+        received_monotonic_ns = time.monotonic_ns()
         with self._lock:
             if generation != self._generation or (cancel_event and cancel_event.is_set()):
                 return
             session = self._session
+            assembler = self._assembler
             pipeline = self._pipeline
+        if session is None or assembler is None:
+            raise RuntimeError("Curry 握手尚未准备好窗口累积器")
+        if pipeline is None:
+            raise RuntimeError("P2 处理线程尚未准备好，不能接纳 EEG 窗口")
+
+        windows = assembler.push(block)
+        try:
+            for window in windows:
+                self._accept_epoch(
+                    generation,
+                    cancel_event,
+                    session,
+                    assembler,
+                    pipeline,
+                    window,
+                    received_utc,
+                    received_monotonic_ns,
+                )
+        except ProcessingBacklogError:
+            # Drain the current packet's lazy iterator so the residual state
+            # is truthful before the session is stopped for overflow.
+            for _ in windows:
+                pass
+            raise
+        finally:
+            self._refresh_assembly_snapshot(generation, assembler)
+
+    def _accept_epoch(
+        self,
+        generation: int,
+        cancel_event: threading.Event | None,
+        session: SessionInfo,
+        assembler: ThirtySecondEpochAssembler,
+        pipeline: ProcessingPipeline,
+        block: DataBlock,
+        received_utc: str,
+        received_monotonic_ns: int,
+    ) -> None:
         validate_data_block(block, session=session)
         with self._lock:
             if generation != self._generation or (cancel_event and cancel_event.is_set()):
@@ -591,30 +706,65 @@ class CurrySessionController(QObject):
             self._validated_blocks += 1
             block_id = self._validated_blocks
             session_id = self._session_id
-        if pipeline is None or session_id is None:
-            raise RuntimeError("P2 处理线程尚未准备好，不能接纳 EEG 块")
+        if session_id is None:
+            raise RuntimeError("当前会话标识尚未准备好，不能接纳 EEG 窗口")
         context = BlockContext(
             session_id=session_id,
             block_id=block_id,
             block=block,
-            received_utc=utc_now_iso(),
-            received_monotonic_ns=time.monotonic_ns(),
+            received_utc=received_utc,
+            received_monotonic_ns=received_monotonic_ns,
         )
         if not pipeline.enqueue(context):
             error = ProcessingBacklogError(
-                f"分期/记录队列已满（最多等待 {pipeline.pending_limit} 块）；"
-                f"已接纳前 {block_id - 1} 块，本块未接纳，采集已停止"
+                f"分期/记录队列已满（最多等待 {pipeline.pending_limit} 个完整窗口）；"
+                f"已接纳前 {block_id - 1} 个窗口，本窗口未接纳，采集已停止"
             )
             with self._lock:
                 self._fatal_error = error
             pipeline.cancel_active_prediction()
             raise error
+        assembler.mark_accepted_window()
         with self._lock:
             self._accepted_blocks += 1
-        self._latest.put(
-            QueuedBlock(block_id, block, generation=generation)
-        )
-        self.diagnostics_changed.emit(self.diagnostics_text())
+        self._latest.put(QueuedBlock(block_id, block, generation=generation))
+
+    def _refresh_assembly_snapshot(
+        self,
+        generation: int,
+        assembler: ThirtySecondEpochAssembler,
+    ) -> None:
+        snapshot = assembler.snapshot()
+        with self._lock:
+            if generation != self._generation or self._assembler is not assembler:
+                return
+            self._assembly_snapshot = snapshot
+            self._assembly_progress_dirty = True
+
+    def _finalize_assembly(self, generation: int) -> EpochAssemblySnapshot | None:
+        with self._lock:
+            if generation != self._generation or self._assembler is None:
+                return None
+            assembler = self._assembler
+        snapshot = assembler.finalize()
+        with self._lock:
+            if generation != self._generation or self._assembler is not assembler:
+                return None
+            self._assembly_snapshot = snapshot
+            self._assembly_progress_dirty = True
+        self.assembly_progress_changed.emit(snapshot)
+        return snapshot
+
+    @Slot()
+    def _flush_assembly_progress(self) -> None:
+        with self._lock:
+            if not self._assembly_progress_dirty:
+                return
+            snapshot = self._assembly_snapshot
+            self._assembly_progress_dirty = False
+        if snapshot is not None:
+            self.assembly_progress_changed.emit(snapshot)
+            self.diagnostics_changed.emit(self.diagnostics_text())
 
     @Slot(int, bool, object)
     def _on_network_finished(
@@ -628,6 +778,7 @@ class CurrySessionController(QObject):
                 return
             fatal_error = self._fatal_error
             pipeline = self._pipeline
+            assembly = self._assembly_snapshot
             self._network_done = True
             self._network_cancelled = cancelled
             self._network_error = fatal_error or error
@@ -637,6 +788,14 @@ class CurrySessionController(QObject):
                 "接收结束；自动决策已关闭"
             )
         if pipeline is not None:
+            # The network worker normally committed this before emitting the
+            # Qt lifecycle signal. Keep this idempotent fallback for startup
+            # failures or custom clients that return through the signal path.
+            pipeline.handoff_network_end(
+                assembly.to_dict() if assembly is not None else None,
+                cancelled=cancelled,
+                error=network_error,
+            )
             pipeline.finish(cancelled=cancelled, error=network_error)
         self._maybe_finalize(generation)
 
@@ -726,6 +885,7 @@ class CurrySessionController(QObject):
             self._client = None
             self._cancel_event = None
             self._pipeline = None
+            self._progress_timer.stop()
             self._session_terminal = True
             self._terminal_cancelled = cancelled
             self._terminal_error = error
