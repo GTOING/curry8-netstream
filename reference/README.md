@@ -19,3 +19,4 @@
 - [用户需求整理](../docs/SLEEP_STIM_REQUIREMENTS.md)
 - [代码与文档分析](../reports/2026-09-15_reference_review.md)
 - [当前任务队列](../decision_records/ACTIVE_QUEUE.md)
+- [P4-B 执行任务快照](CURRENT_TASK_QUEUE.md)：供对应执行人员领取；动态状态仍以权威队列为准。
