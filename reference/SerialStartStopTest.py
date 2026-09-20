@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import math
 from ctypes import wintypes
 import re
 import sys
@@ -20,6 +21,24 @@ START_FRAME = bytes.fromhex("01 E1 01 00 C0")
 STOP_FRAME = bytes.fromhex("01 E1 01 00 80")
 CONFIRMATION = "I_ACCEPT_PHYSICAL_STIMULATION"
 PORT_PATTERN = re.compile(r"COM([1-9][0-9]*)", re.IGNORECASE)
+STOP_WRITE_TIMEOUT_SECONDS = 1.0
+_monotonic = time.monotonic
+
+
+def _validate_duration(seconds: float) -> None:
+    if not math.isfinite(seconds) or not 0.1 <= seconds <= 10.0:
+        raise ValueError("--duration must be between 0.1 and 10 finite seconds")
+
+
+def _validate_read_seconds(seconds: float) -> None:
+    if not math.isfinite(seconds) or not 0 <= seconds <= 10.0:
+        raise ValueError("--read-seconds must be between 0 and 10 finite seconds")
+
+
+def _timeout_milliseconds(seconds: float) -> int:
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("serial I/O timeout must be a finite number greater than zero")
+    return max(1, min(0xFFFFFFFE, math.ceil(seconds * 1000)))
 
 
 if sys.platform == "win32":
@@ -112,8 +131,6 @@ def _configure_win32() -> None:
         wintypes.LPVOID,
     ]
     kernel32.ReadFile.restype = wintypes.BOOL
-    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
-    kernel32.FlushFileBuffers.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -202,16 +219,9 @@ class WindowsSerialPort:
             dcb.Parity = 0  # NOPARITY
             dcb.StopBits = 0  # ONESTOPBIT
             _checked(kernel32.SetCommState(handle, ctypes.byref(dcb)), "SetCommState")
-            timeouts = COMMTIMEOUTS(
-                0xFFFFFFFF,
-                0,
-                self.read_timeout_ms,
-                0,
-                1000,
-            )
-            _checked(
-                kernel32.SetCommTimeouts(handle, ctypes.byref(timeouts)),
-                "SetCommTimeouts",
+            self._set_timeouts(
+                read_timeout_ms=self.read_timeout_ms,
+                write_timeout_ms=_timeout_milliseconds(STOP_WRITE_TIMEOUT_SECONDS),
             )
             _checked(
                 kernel32.PurgeComm(
@@ -237,13 +247,45 @@ class WindowsSerialPort:
             raise RuntimeError("serial port is not open")
         return self.handle
 
+    def _set_timeouts(self, *, read_timeout_ms: int, write_timeout_ms: int) -> None:
+        assert kernel32 is not None
+        timeouts = COMMTIMEOUTS(
+            0xFFFFFFFF,
+            0,
+            read_timeout_ms,
+            0,
+            write_timeout_ms,
+        )
+        _checked(
+            kernel32.SetCommTimeouts(
+                self._open_handle(),
+                ctypes.byref(timeouts),
+            ),
+            "SetCommTimeouts",
+        )
+
     def purge_input(self) -> None:
         assert kernel32 is not None
         _checked(kernel32.PurgeComm(self._open_handle(), PURGE_RXCLEAR), "PurgeComm")
 
-    def write(self, payload: bytes) -> None:
+    def write(self, payload: bytes, *, deadline: float | None = None) -> None:
         assert kernel32 is not None
         handle = self._open_handle()
+        if deadline is None:
+            timeout_seconds = STOP_WRITE_TIMEOUT_SECONDS
+        else:
+            if not math.isfinite(deadline):
+                raise ValueError("serial write deadline must be finite")
+            timeout_seconds = deadline - _monotonic()
+            if timeout_seconds <= 0:
+                raise TimeoutError("START software budget expired before WriteFile")
+        timeout_ms = _timeout_milliseconds(timeout_seconds)
+        self._set_timeouts(
+            read_timeout_ms=self.read_timeout_ms,
+            write_timeout_ms=timeout_ms,
+        )
+        if deadline is not None and deadline <= _monotonic():
+            raise TimeoutError("START software budget expired before WriteFile")
         buffer = ctypes.create_string_buffer(payload)
         written = wintypes.DWORD()
         _checked(
@@ -258,16 +300,36 @@ class WindowsSerialPort:
         )
         if written.value != len(payload):
             raise OSError(f"short serial write: {written.value}/{len(payload)} bytes")
-        _checked(kernel32.FlushFileBuffers(handle), "FlushFileBuffers")
 
-    def read_for(self, seconds: float) -> bytes:
+    def read_for(
+        self,
+        seconds: float,
+        *,
+        deadline: float | None = None,
+        stop_on_data: bool = False,
+    ) -> bytes:
         assert kernel32 is not None
-        if seconds < 0:
-            raise ValueError("read duration must be non-negative")
+        _validate_read_seconds(seconds)
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("read deadline must be finite")
         handle = self._open_handle()
-        deadline = time.monotonic() + seconds
+        read_deadline = _monotonic() + seconds
+        if deadline is not None:
+            read_deadline = min(read_deadline, deadline)
         chunks: list[bytes] = []
-        while time.monotonic() < deadline:
+        while True:
+            remaining = read_deadline - _monotonic()
+            if remaining <= 0:
+                break
+            read_timeout_ms = min(
+                self.read_timeout_ms,
+                _timeout_milliseconds(remaining),
+            )
+            # Each synchronous ReadFile gets no more than the current remainder.
+            self._set_timeouts(
+                read_timeout_ms=read_timeout_ms,
+                write_timeout_ms=_timeout_milliseconds(STOP_WRITE_TIMEOUT_SECONDS),
+            )
             buffer = ctypes.create_string_buffer(256)
             received = wintypes.DWORD()
             _checked(
@@ -282,8 +344,8 @@ class WindowsSerialPort:
             )
             if received.value:
                 chunks.append(buffer.raw[: received.value])
-            else:
-                time.sleep(0.01)
+                if stop_on_data:
+                    break
         return b"".join(chunks)
 
 
@@ -293,11 +355,27 @@ def send_frame(
     *,
     label: str,
     read_seconds: float,
+    budget_seconds: float | None = None,
+    stop_on_data: bool = False,
 ) -> bytes:
+    _validate_read_seconds(read_seconds)
+    if budget_seconds is not None:
+        _validate_duration(budget_seconds)
     serial_port.purge_input()
-    serial_port.write(frame)
     print(f"[{_timestamp()}] TX {serial_port.port} {label}: {_hex(frame)}")
-    response = serial_port.read_for(read_seconds)
+    deadline = None
+    if budget_seconds is None:
+        # STOP has its own finite write timeout, independent of the START budget.
+        serial_port.write(frame)
+    else:
+        # Begin the START budget immediately before the synchronous write call.
+        deadline = _monotonic() + budget_seconds
+        serial_port.write(frame, deadline=deadline)
+    response = serial_port.read_for(
+        read_seconds,
+        deadline=deadline,
+        stop_on_data=stop_on_data,
+    )
     if response:
         print(f"[{_timestamp()}] RX {serial_port.port}: {_hex(response)}")
     else:
@@ -335,65 +413,72 @@ def run(args: argparse.Namespace) -> int:
         print("DRY RUN ONLY: the COM port was not opened and no frame was sent.")
         return 0
 
-    if args.read_seconds < 0 or args.read_seconds > 10:
-        raise ValueError("--read-seconds must be between 0 and 10")
+    _validate_read_seconds(args.read_seconds)
+    if args.action == "cycle":
+        _validate_duration(args.duration)
     _require_execution(args, starts_stimulation=args.action == "cycle")
 
     with WindowsSerialPort(args.port, args.baud) as serial_port:
         if args.action == "stop":
-            response = send_frame(
-                serial_port,
-                STOP_FRAME,
-                label="STOP",
-                read_seconds=args.read_seconds,
+            try:
+                send_frame(
+                    serial_port,
+                    STOP_FRAME,
+                    label="STOP",
+                    read_seconds=args.read_seconds,
+                )
+            except Exception as exc:
+                print(
+                    f"STOP ATTEMPT FAILED: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                print(
+                    "停止未确认，请使用独立停止方式并核实物理输出。",
+                    file=sys.stderr,
+                )
+                return 2
+            print(
+                "停止未确认，请使用独立停止方式并核实物理输出。",
+                file=sys.stderr,
             )
-            return 0 if response else 2
+            return 3
 
-        if not 0.1 <= args.duration <= 10.0:
-            raise ValueError("--duration must be between 0.1 and 10 seconds")
-        start_sent = False
-        result_code = 2
-        stop_response = b""
         try:
-            start_sent = True
             start_response = send_frame(
                 serial_port,
                 START_FRAME,
                 label="START",
                 read_seconds=args.read_seconds,
+                budget_seconds=args.duration,
+                stop_on_data=True,
             )
-            if not start_response:
-                print("Start was not acknowledged; sending STOP immediately.")
+            if start_response:
+                print(
+                    "收到字节；命令/物理状态未确认，立即尝试保护性 STOP。"
+                )
             else:
                 print(
-                    f"A response was received. Observe the approved test load for "
-                    f"{args.duration:g}s; STOP will then be sent automatically."
+                    "START 读取预算结束但未收到字节；命令/物理状态未确认，"
+                    "立即尝试保护性 STOP。"
                 )
-                deadline = time.monotonic() + args.duration
-                while time.monotonic() < deadline:
-                    time.sleep(min(0.05, deadline - time.monotonic()))
-                result_code = 0
         finally:
-            if start_sent:
-                try:
-                    stop_response = send_frame(
-                        serial_port,
-                        STOP_FRAME,
-                        label="STOP",
-                        read_seconds=args.read_seconds,
-                    )
-                except Exception as exc:
-                    print(
-                        f"STOP ATTEMPT FAILED: {type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-                if not stop_response:
-                    print(
-                        "STOP WAS NOT CONFIRMED. Use the independent hardware/Rally "
-                        "stop procedure and verify output physically.",
-                        file=sys.stderr,
-                    )
-        return result_code if stop_response else 3
+            try:
+                send_frame(
+                    serial_port,
+                    STOP_FRAME,
+                    label="STOP",
+                    read_seconds=args.read_seconds,
+                )
+            except Exception as exc:
+                print(
+                    f"STOP ATTEMPT FAILED: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            print(
+                "停止未确认，请使用独立停止方式并核实物理输出。",
+                file=sys.stderr,
+            )
+        return 3
 
 
 def build_parser() -> argparse.ArgumentParser:
