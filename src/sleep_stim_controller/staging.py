@@ -263,6 +263,13 @@ class ProcessingPipeline:
         self._network_handoff_received = False
         self._network_end_cancelled = False
         self._network_end_error: BaseException | None = None
+        # This is the control-lease admission barrier, not merely a marker
+        # written after SessionWriter.finish().  Once the worker has drained
+        # the final accepted event/lease set, it flips this under
+        # ``_condition`` before entering writer.finish(), so a late required
+        # Stop can still be attempted but cannot be mistaken for a persistable
+        # lifecycle.
+        self._closed = False
 
     def start(self) -> None:
         self._thread.start()
@@ -298,6 +305,23 @@ class ProcessingPipeline:
             self._condition.notify_all()
             return True
 
+    def acquire_control_work(self) -> bool:
+        """Reserve a necessary control-stop lifecycle during session close.
+
+        This is intentionally separate from :meth:`acquire_external_work`.
+        Normal asynchronous work must stop at ``finish`` or an external
+        recording error, while a protective Rally Stop may still need to keep
+        the writer alive long enough to persist its final outcome.  If the
+        writer has already closed, the caller may still make a best-effort
+        network stop without a lease; this method then returns ``False``.
+        """
+        with self._condition:
+            if self._closed:
+                return False
+            self._external_work += 1
+            self._condition.notify_all()
+            return True
+
     def release_external_work(self) -> None:
         with self._condition:
             if self._external_work > 0:
@@ -310,7 +334,7 @@ class ProcessingPipeline:
             return "unrecorded"
         failure: BaseException | None = None
         with self._condition:
-            if self._external_error is not None:
+            if self._closed or self._external_error is not None:
                 return None
             if (
                 len(self._session_events) + len(self._event_reservations)
@@ -346,7 +370,7 @@ class ProcessingPipeline:
         with self._condition:
             if token not in self._event_reservations:
                 return False
-            if self._external_error is not None:
+            if self._closed or self._external_error is not None:
                 # The outbound request may already have crossed the socket
                 # boundary. Release its writer-capacity reservation even when
                 # the failed session can no longer persist request_sent.
@@ -370,7 +394,7 @@ class ProcessingPipeline:
             return True
         failure: BaseException | None = None
         with self._condition:
-            if self._external_error is not None:
+            if self._closed or self._external_error is not None:
                 return False
             if not self._validate_session_event(event):
                 failure = ValueError("P3 会话事件与当前会话不匹配")
@@ -392,6 +416,14 @@ class ProcessingPipeline:
         return False
 
     def _validate_session_event(self, event: dict[str, object]) -> bool:
+        if event.get("event_type") == "rally_control":
+            try:
+                from .rally_control_schema import validate_rally_control_event
+
+                validate_rally_control_event(event)
+            except (TypeError, ValueError):
+                return False
+            return event.get("session_id") == self.session_id
         return (
             event.get("session_id") == self.session_id
             and event.get("event_type")
@@ -541,6 +573,13 @@ class ProcessingPipeline:
                                 or self._network_handoff_received
                             )
                         ):
+                            # This is the atomic handoff from accepting
+                            # necessary control lifecycles to closing the
+                            # writer.  acquire_control_work() uses this same
+                            # condition, so a late EOF callback cannot acquire
+                            # a lease after the final event-drain point.
+                            self._closed = True
+                            self._condition.notify_all()
                             context = None
                             break
                         self._condition.wait()
@@ -626,6 +665,12 @@ class ProcessingPipeline:
                         self.on_fatal(exc)
             with self._condition:
                 if fatal_error is not None:
+                    # No writer loop remains to drain events after this
+                    # point. Mark the recording/processing failure before
+                    # clearing the queue so a late control callback is
+                    # rejected as missing evidence rather than being
+                    # accepted into an undrained queue.
+                    self._external_error = self._external_error or fatal_error
                     if in_flight is not None:
                         self._unprocessed_blocks += 1
                     self._unprocessed_blocks += len(self._pending)
@@ -644,6 +689,12 @@ class ProcessingPipeline:
                 # writer is closed, including after an earlier recording error.
                 while self._external_work or self._event_reservations:
                     self._condition.wait(0.05)
+                # Fatal/recording-error paths bypass the normal ``done``
+                # branch above.  Apply the same admission barrier after their
+                # accepted work and reservations have drained, before the
+                # writer is asked to append session_finished.
+                self._closed = True
+                self._condition.notify_all()
                 accepted = self._accepted_blocks
                 rejected = self._rejected_blocks
                 unprocessed = self._unprocessed_blocks
@@ -676,6 +727,9 @@ class ProcessingPipeline:
                     final_error = final_error or exc
                     if self.on_fatal is not None:
                         self.on_fatal(exc)
+            with self._condition:
+                self._closed = True
+                self._condition.notify_all()
             if not self._ready:
                 self._signal_ready(final_error or RuntimeError("处理线程未能启动"))
             if self.on_finished is not None:

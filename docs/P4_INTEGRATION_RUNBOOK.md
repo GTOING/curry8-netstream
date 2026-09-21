@@ -1,6 +1,6 @@
 # P4 接入准备操作手册
 
-日期：2026-09-16。适用于 P4 后续单独定界的接入准备；不构成真实采集、模型、Rally、刺激或同步操作授权。当前产品状态仍是 P1/P2/P3：Curry TCP 客户端、NoModel、可选记录/只读回放及本应用本机 UDP 模拟。
+日期：2026-09-21。适用于 P4 后续单独定界的接入准备；不构成真实采集、模型、Rally、刺激或同步操作授权。当前产品包含 P1/P2、P3 本机模拟、可选 ONNX，以及 P4-B 真实 Rally 启停工程路径；本轮真实模式只在随机 loopback 假端点上自动化验证。
 
 ## 平台更新
 
@@ -14,10 +14,10 @@
 | 网络包/分析窗口 | validate_stream_block() → ThirtySecondEpochAssembler → `_accept_epoch()` | 包频率只影响累计速度；首包可从非零样本号开始；跨包、跨 TCP 分段、单包多窗均按绝对样本连续拼接；不足 30 秒尾段不入队 | 不补点、不重采样、不按包数切窗；当前实时事件语义未校准，带事件网络包会明确失败 |
 | 块上下文 | CurrySessionController._accept_block() → BlockContext | block_id、样本范围、使窗口完整的最后网络包入口 UTC 与本机 monotonic_ns；session 内样本连续性可检查 | 接收时间不是 EEG 精确采样时刻；不同进程的 monotonic 时钟不能直接比较 |
 | 处理/保存 | ModelAdapter；ProcessingPipeline；SessionWriter/SessionReader | 默认 NoModel；有界顺序处理；记录默认关闭；启用后保存解码原值和关联事件；回放只读 | 不自动推断预处理、通道映射、单位或分期效果；回放不运行模型或通信 |
-| P3 策略/Rally | StimulationRuntime；LoopbackRallySimulator；RallyTransportWorker | 显式配置目标期、策略、间隔、结果年龄及 JSON；仅发往本应用持有的 127.0.0.1 随机端口模拟器；单请求、无自动重试 | 没有真实 Rally 端点、8801 解锁或真实设备控制接口；API 成功不是刺激输出证据 |
+| P3/P4-B 策略/Rally | StimulationRuntime；LoopbackRallySimulator；RallyTransportWorker；RallyControlTransportWorker | P3 使用 app-owned 随机 loopback JSON 模拟；P4-B 真实模式固定 `127.0.0.1:8801`，二值 `Start Stim`/`Stop Stim`，单请求、源主机校验、动态回复端口记录、有限超时和迟到 socket 隔离；现有 GUI 周期 tick 与 sendto 前复核共同保护结果年龄 | 本轮没有连接真实 Rally/Curry/硬件；API 回复只证明软件收到协议回复，不证明物理刺激或停止 |
 | 时间 | BlockContext 与 ProcessingResult 单调时间、UTC 日志时间及样本索引 | 可描述本进程收到/处理/发送/收到响应的顺序与耗时 | 没有 Curry、模型主机、Rally 和刺激输出之间的时钟映射、硬件事件同步或误差保证 |
 
-P2 会话中 block_saved 与 processing_result 由单一写者追加；P3 决策和请求结果复用该写者。SessionReader 回放不会连接 Curry/Rally、不重新推理、不运行策略。保持 NoModel 默认；不在生产 UI/CLI 加入伪分期入口。
+P2 会话中 block_saved 与 processing_result 由单一写者追加；P3 决策和请求结果、P4-B `rally_control` 事件复用该写者。P4-B 基线/退出停止可没有 EEG block；保存关闭只保留内存/UI 状态。普通 external-work 在 pipeline 收尾或记录故障后仍拒绝，必要 Stop 使用独立控制租约保持一次收尾，租约覆盖最终 outcome 事件及补偿停止；自然 EOF/网络异常由网络 worker 在 `handoff_network_end` 前先登记 runtime 收尾，Qt 回调只作幂等兜底。pipeline 在 condition 锁内先排空已接纳事件/租约和事件预留，再关闭新控制租约；磁盘不可写时继续尽力发送并报告控制证据缺失，不把记录说成成功。可写会话的 `session_finished` 在最后控制事件之后写入，关闭屏障后的迟到事件不会重新打开 writer。SessionReader 回放展示控制历史但不会连接 Curry/Rally、不重新推理、不运行策略、不重发。保持 NoModel 默认；不在生产 UI/CLI 加入伪分期入口。
 
 ## 原生桌面启动与核验
 
@@ -49,16 +49,16 @@ P2 会话中 block_saved 与 processing_result 由单一写者追加；P3 决策
 
 后续接入前须由用户提供模型包及版本/许可、模型输入输出说明、通道与顺序、单位、采样率、预处理和窗口语义、设备/算力依赖、取消/关闭要求、代表性测试样例及允许的运行范围。适配器从 BlockContext 和独立数据副本运行，不能改写保存的原始 DataBlock；必须验证加载/失败/取消/非法输出/耗时与结果关联。不得凭工程推理成功宣称睡眠分期准确；准确性需单独的研究设计、独立标签和验收授权。
 
-## Rally/刺激接入缺口
+## Rally/刺激接入边界
 
-当前实现只包含 P3 JSON 结构校验及 app-owned 随机 loopback 模拟器；Rally 协议适配不能被当作真实连接器。解锁任何真实请求前，主线程必须取得并冻结：
+P4-B 已实现受明确启用保护的二值 Rally 启停路径，但不选择或修改刺激范式。真实接入/现场验收前仍必须取得并冻结：
 
 - Rally 软件/固件/服务进程版本、部署机器和经授权的网络端点；官方 API/SDK 文档、初始请求格式、字段类型、单位、合法响应码和协议版本。
 - 用户核准的具体刺激协议及工程/设备限制：通道映射、极性、幅度、电流/电荷/频率/脉宽/占空等参数含义与上下限。不能从 Demo、PPT 或 P3 JSON schema 推导安全阈值。
-- 实际开始、持续、修改、停止命令语义；独立设备状态/输出观察接口；请求关联、超时/未知结果处理、幂等规则和错误恢复。必须说明由谁以及如何独立确认实际输出和停止。
+- 实际开始、持续、修改、停止命令语义；独立设备状态/输出观察接口；请求关联、超时/未知结果处理、幂等规则和错误恢复。当前二值接口没有 vendor request id，因此软件只把精确 API 回复记录为协议确认，不把它升级为物理输出确认。
 - 独立紧急停止路径、风险评估、设备/人员安全程序、正式联调授权及限定测试条件。
 
-P3 的成功响应只证明模拟 API 返回成功。unknown、拒绝不重发；关闭自动决策只阻止新请求，不停止设备；关闭 app 或 Python 进程也不等于设备停止。当前产品不提供真实地址或真实发送开关。
+P3 的成功响应只证明模拟 API 返回成功。P4-B 真实模式默认关闭，固定端点为 `127.0.0.1:8801`，每次启用先 Stop 基线；启动 unknown/拒绝/超时只做一次补偿 Stop，停止失败进入 `FAULT/UNKNOWN` 并要求独立停止。已 armed 会话不再收到新结果时，GUI 周期 tick 使用配置的最大结果年龄解除控制并执行一次保护性 Stop；等待 Stop 期间会再次检查缓存年龄，过期结果不能触发 Start。隔离 socket 普通 Start 受上限约束，并保留一次 Stop/启动不确定补偿容量，不释放旧 socket 重用端口。unknown、拒绝不循环重试；关闭 app 或 Python 进程也不等于设备停止。当前自动化测试不使用 8801/COM/真实设备。
 
 ## 同步接入缺口
 
@@ -66,4 +66,6 @@ P3 的成功响应只证明模拟 API 返回成功。unknown、拒绝不重发�
 
 ## 后续批次交付证据
 
-每项真实接入任务应明确设备/模型版本、端点及授权、配置文件身份、所用数据范围、命令与退出状态、原始失败和复测结果、线程/连接关闭证据、独立观察来源及不能支持的结论。先以合成 TCP 与 app-owned UDP 模拟验证软件路径，再按单独冻结的合同执行设备验证。真实采集、真实 Rally/刺激、模型本体/训练、受试者实验、紧急停止和时钟同步均不属于 P4-A。
+每项真实接入任务应明确设备/模型版本、端点及授权、配置文件身份、所用数据范围、命令与退出状态、原始失败和复测结果、线程/连接关闭证据、独立观察来源及不能支持的结论。先以合成 TCP 与 loopback Rally 假端验证软件路径，再按单独冻结的合同执行设备验证。P4-B 已完成软件启停与记录路径，但真实 Rally/刺激、模型效果、受试者实验、紧急停止和时钟同步仍未在本工作区执行。
+
+P4-B 实现字段、状态转换、记录 schema v1 和回放规则见 [P4-B Rally 控制合同](P4B_RALLY_CONTROL_CONTRACT.md)。

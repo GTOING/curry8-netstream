@@ -38,6 +38,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_windows.
 
 回环测试验证 TCP 分段/粘包、短包跨窗、记录/回放和取消收尾；它不能替代 Windows 上的真实 Curry 验收。
 
+## P4-B Rally 启停模式
+
+GUI 默认选择“本机模拟（P3）”，真实 Rally 模式保持关闭。真实模式只允许固定本机 UDP 端点 `127.0.0.1:8801`，不提供任意地址输入，也不读取或修改 Rally 当前已加载的刺激协议；操作员须先在 Rally 中加载并检查协议，再勾选界面的明确确认框。只有当前实时 Curry 会话完成握手、连接前显式选择 ONNX、目标期/策略/结果年龄等配置完整时，真实自动控制才可启用。
+
+每次启用先发 `Stop Stim` 基线；精确收到 `停止刺激成功` 或兼容回复 `RALLY_ERROR_SUCCESS` 后，下一条合格 ONNX 结果才可发送 `Start Stim`，非目标期发送 `Stop Stim`。GUI 周期会用已填写的最大结果年龄检查静默流，真正发送 `Start Stim` 前还会复核 session、基线、armed 状态和缓存年龄，过期缓存不能在等待 Stop 后再次启动。真实命令没有 vendor request id，程序使用单 worker、每请求独立 UDP socket 和迟到回复隔离；回复主机必须为 `127.0.0.1`，源端口可以是 Rally 的动态端口。普通 Start 受隔离容量上限约束，并保留一次 Stop/启动不确定补偿容量，不释放旧 socket 复用端口。界面展示“发送中”和“最近确认”两套状态，API 确认不等于物理输出确认。
+
+启动拒绝、未知或超时不自动重试启动，只进行一次有界补偿停止；停止失败显示 `FAULT/UNKNOWN`，此时必须使用 Rally/硬件侧独立停止。断流、模型失败、关闭窗口和退出也会尝试一次停止；自然 TCP EOF/网络异常在网络线程放行 pipeline 关闭前先登记 runtime 收尾，普通 pipeline 收尾/记录故障不会撤销必要 Stop 的专用收尾租约。writer 在同一 condition 锁内越过最终事件排空点后关闭新租约准入；记录不可用时会报告控制事件缺失而不虚报保存成功。可写记录会在最终控制事件后写入 `session_finished`。操作系统异常或进程被杀不能保证停止。当前实现的自动化验证仅使用随机 loopback 假端点；本项目没有在 Windows 上连接真实 Rally、Curry 或电刺激硬件，macOS 离屏结果不代表 Windows 原生窗口或硬件验收。
+
 失败时保留项目、缓存与失败环境，退出码为 1；依提示检查网络、写入权限或项目完整性后重新运行。该脚本不安装 Curry/Rally 软件、设备驱动或修改防火墙。
 
 验证限制：脚本在 macOS 工作区生成并进行静态检查，尚未实际执行 Windows 安装流程；此前应用测试结果不代表此脚本已在 Windows 实测。

@@ -13,7 +13,9 @@ import socket
 import threading
 import time
 import uuid
+from base64 import b64encode
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Callable, Sequence
 
 from .stimulation import (
@@ -23,6 +25,7 @@ from .stimulation import (
     ParsedRallyResponse,
     parse_rally_response,
 )
+from .rally_control_schema import validate_rally_control_event
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,3 +575,452 @@ class RallyTransportWorker:
         from .stimulation import build_rally_message
 
         return build_rally_message(request.protocol)
+
+
+REAL_RALLY_HOST = "127.0.0.1"
+REAL_RALLY_PORT = 8801
+RALLY_START_COMMAND = "Start Stim"
+RALLY_STOP_COMMAND = "Stop Stim"
+RALLY_START_SUCCESS = "启动刺激成功"
+RALLY_STOP_SUCCESS = "停止刺激成功"
+
+
+@dataclass(frozen=True, slots=True)
+class RallyControlEndpoint:
+    """A loopback Rally control endpoint.
+
+    The production runtime constructs the default endpoint only.  Tests may
+    inject another loopback port, but the worker still rejects non-loopback
+    hosts.  The application does not expose this injection point in its GUI.
+    """
+
+    host: str = REAL_RALLY_HOST
+    port: int = REAL_RALLY_PORT
+
+    def __post_init__(self) -> None:
+        if self.host != REAL_RALLY_HOST:
+            raise ValueError("真实 Rally 控制端点必须是 127.0.0.1")
+        if isinstance(self.port, bool) or not isinstance(self.port, int):
+            raise ValueError("Rally 控制端口必须是整数")
+        if not 1 <= self.port <= 65535:
+            raise ValueError("Rally 控制端口必须在 1–65535 范围内")
+
+
+REAL_RALLY_ENDPOINT = RallyControlEndpoint()
+
+
+class RallyControlState(StrEnum):
+    DISARMED_UNKNOWN = "DISARMED/UNKNOWN"
+    STOPPED = "STOPPED"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    STOPPING = "STOPPING"
+    FAULT_UNKNOWN = "FAULT/UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class RallyControlRequest:
+    """One binary Rally start/stop request without a vendor request id."""
+
+    request_id: str
+    session_id: str
+    generation: int
+    command: str
+    reason: str
+    block_id: int | None
+    stage: str | None
+    model: dict[str, object] | None
+    target_stages: tuple[str, ...]
+    desired_state: str
+    confirmed_state: str | None
+    runtime_state: str
+    created_utc: str
+    created_monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        if self.command not in {RALLY_START_COMMAND, RALLY_STOP_COMMAND}:
+            raise ValueError("Rally 控制命令必须是 Start Stim 或 Stop Stim")
+        if not self.request_id.strip() or not self.session_id.strip():
+            raise ValueError("Rally 控制请求必须有 request_id 和 session_id")
+        if self.desired_state not in {"RUNNING", "STOPPED"}:
+            raise ValueError("Rally 控制请求 desired_state 无效")
+        if self.block_id is not None and (
+            isinstance(self.block_id, bool) or self.block_id <= 0
+        ):
+            raise ValueError("Rally 控制请求 block_id 无效")
+
+
+@dataclass(frozen=True, slots=True)
+class RallyControlOutcome:
+    status: RequestStatus
+    message: str
+    raw_text: str | None = None
+    raw_bytes: bytes | None = None
+    response_source_host: str | None = None
+    response_source_port: int | None = None
+    sent_monotonic_ns: int | None = None
+    received_monotonic_ns: int | None = None
+
+    def raw_bytes_b64(self) -> str | None:
+        if self.raw_bytes is None:
+            return None
+        return b64encode(self.raw_bytes).decode("ascii")
+
+
+def parse_rally_control_response(
+    command: str, data: bytes
+) -> RallyControlOutcome:
+    """Classify one exact UTF-8 reply for one exact binary command.
+
+    ``RALLY_ERROR_SUCCESS`` is the only command-independent compatibility
+    success.  The Chinese success reply is deliberately command-specific;
+    whitespace, a wrong-command success string, empty data, malformed UTF-8,
+    and unknown text never become success.
+    """
+
+    raw = bytes(data)
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return RallyControlOutcome(
+            RequestStatus.UNKNOWN,
+            "Rally 响应不是有效 UTF-8，结果未知",
+            raw_bytes=raw,
+        )
+    success = (
+        (command == RALLY_START_COMMAND and text == RALLY_START_SUCCESS)
+        or (command == RALLY_STOP_COMMAND and text == RALLY_STOP_SUCCESS)
+        or text == "RALLY_ERROR_SUCCESS"
+    )
+    if success:
+        return RallyControlOutcome(
+            RequestStatus.API_SUCCESS,
+            "Rally 已返回与命令匹配的成功回复",
+            raw_text=text,
+            raw_bytes=raw,
+        )
+    if not text:
+        message = "Rally 返回空回复，结果未知"
+    elif text in {RALLY_START_SUCCESS, RALLY_STOP_SUCCESS}:
+        message = "Rally 成功文本与当前命令不匹配，结果未知"
+    else:
+        parsed = parse_rally_response(raw)
+        if parsed.status is RequestStatus.API_REJECTED:
+            message = f"Rally 拒绝 {command}：{parsed.message}"
+        else:
+            message = f"无法解释 Rally 回复，结果未知：{text}"
+    return RallyControlOutcome(
+        RequestStatus.API_REJECTED
+        if text.startswith("RALLY_ERROR_") and text != "RALLY_ERROR_SUCCESS"
+        else RequestStatus.UNKNOWN,
+        message,
+        raw_text=text or None,
+        raw_bytes=raw,
+    )
+
+
+@dataclass(slots=True)
+class _ControlCommand:
+    request: RallyControlRequest
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    sent: bool = False
+
+
+ControlBeforeSend = Callable[[RallyControlRequest, int], tuple[bool, str]]
+ControlOnSent = Callable[[RallyControlRequest, int], None]
+ControlOnNotSent = Callable[[RallyControlRequest, str, RequestStatus], None]
+ControlOnOutcome = Callable[[RallyControlRequest, RallyControlOutcome], None]
+
+
+class RallyControlTransportWorker:
+    """Single-owner, bounded UDP worker for ``Start/Stop Stim``.
+
+    It intentionally has no request-id matching.  Each command receives a
+    distinct source socket that remains quarantined after timeout/outcome, so
+    a late reply cannot be consumed by a later command.  Only the response
+    source host is fixed; Rally may reply from any dynamic loopback port.
+    """
+
+    def __init__(
+        self,
+        *,
+        before_send: ControlBeforeSend | None = None,
+        on_sent: ControlOnSent,
+        on_not_sent: ControlOnNotSent,
+        on_outcome: ControlOnOutcome,
+        on_diagnostic: Callable[[str], None] | None = None,
+        on_stopped: Callable[[], None] | None = None,
+        timeout_seconds: float = 1.0,
+        endpoint: RallyControlEndpoint = REAL_RALLY_ENDPOINT,
+        max_quarantined_sockets: int = 128,
+    ) -> None:
+        _validate_positive_timeout(timeout_seconds)
+        if not isinstance(endpoint, RallyControlEndpoint):
+            raise TypeError("endpoint 必须是 RallyControlEndpoint")
+        if (
+            isinstance(max_quarantined_sockets, bool)
+            or not isinstance(max_quarantined_sockets, int)
+            or max_quarantined_sockets < 1
+        ):
+            raise ValueError("max_quarantined_sockets 必须大于 0")
+        self.endpoint = endpoint
+        self.max_quarantined_sockets = max_quarantined_sockets
+        self._before_send = before_send
+        self._on_sent = on_sent
+        self._on_not_sent = on_not_sent
+        self._on_outcome = on_outcome
+        self._on_diagnostic = on_diagnostic or (lambda _message: None)
+        self._on_stopped = on_stopped or (lambda: None)
+        self._condition = threading.Condition(threading.RLock())
+        self._timeout_seconds = float(timeout_seconds)
+        self._pending: _ControlCommand | None = None
+        self._current: _ControlCommand | None = None
+        self._shutdown = False
+        self._quarantined: list[socket.socket] = []
+        self._thread = threading.Thread(
+            target=self._run,
+            name="rally-control-transport",
+            daemon=False,
+        )
+        self._thread.start()
+
+    @property
+    def busy(self) -> bool:
+        with self._condition:
+            return self._pending is not None or self._current is not None
+
+    @property
+    def active(self) -> bool:
+        return self._thread.is_alive()
+
+    @property
+    def quarantined_socket_count(self) -> int:
+        with self._condition:
+            return len(self._quarantined)
+
+    @property
+    def timeout_seconds(self) -> float:
+        with self._condition:
+            return self._timeout_seconds
+
+    def set_timeout_seconds(self, seconds: float) -> None:
+        _validate_positive_timeout(seconds)
+        with self._condition:
+            if self._pending is not None or self._current is not None:
+                raise RuntimeError("真实 Rally 请求等待响应期间不能更改通信超时")
+            self._timeout_seconds = float(seconds)
+
+    def submit(self, request: RallyControlRequest) -> bool:
+        if not isinstance(request, RallyControlRequest):
+            raise TypeError("request 必须是 RallyControlRequest")
+        with self._condition:
+            # Outcome callbacks run on this worker thread.  They may need to
+            # enqueue the one next lifecycle command (for example, the
+            # bounded compensating Stop after a failed Start) before the
+            # current command's callback returns.  Other callers must still
+            # observe the ordinary single-current/single-pending limit.
+            callback_reentry = (
+                self._current is not None and threading.current_thread() is self._thread
+            )
+            if (
+                self._shutdown
+                or self._pending is not None
+                or (self._current is not None and not callback_reentry)
+            ):
+                return False
+            # A sent request keeps its source socket quarantined for the whole
+            # worker lifetime.  Regular Starts may use only the normal bound;
+            # one additional slot is reserved for a necessary Stop (including
+            # the bounded compensation after an uncertain Start).  This keeps
+            # late replies isolated without allowing a successful Start to
+            # consume the last Stop capacity.
+            quarantine_limit = self.max_quarantined_sockets
+            if request.command == RALLY_STOP_COMMAND:
+                quarantine_limit += 1
+            if len(self._quarantined) >= quarantine_limit:
+                return False
+            self._pending = _ControlCommand(request)
+            self._condition.notify_all()
+            return True
+
+    def cancel_unsent(self) -> RallyControlRequest | None:
+        with self._condition:
+            if self._pending is not None:
+                self._pending.cancelled.set()
+            if self._current is not None and not self._current.sent:
+                self._current.cancelled.set()
+            self._condition.notify_all()
+            return self._pending.request if self._pending is not None else None
+
+    def shutdown(self) -> None:
+        with self._condition:
+            self._shutdown = True
+            if self._pending is not None:
+                self._pending.cancelled.set()
+            if self._current is not None and not self._current.sent:
+                self._current.cancelled.set()
+            self._condition.notify_all()
+
+    def join(self, timeout: float | None = None) -> bool:
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._shutdown:
+                    self._condition.wait()
+                if self._pending is None and self._shutdown:
+                    break
+                command = self._pending
+                self._pending = None
+                self._current = command
+            if command is None:
+                continue
+            try:
+                self._run_command(command)
+            except Exception as exc:
+                try:
+                    if command.sent:
+                        self._on_outcome(
+                            command.request,
+                            RallyControlOutcome(
+                                RequestStatus.UNKNOWN,
+                                f"Rally UDP 执行异常，结果未知：{exc}",
+                            ),
+                        )
+                    else:
+                        self._on_not_sent(
+                            command.request,
+                            f"Rally UDP 请求未发送：{exc}",
+                            RequestStatus.UNKNOWN,
+                        )
+                except Exception:
+                    pass
+            finally:
+                with self._condition:
+                    self._current = None
+                    self._condition.notify_all()
+        with self._condition:
+            sockets = list(self._quarantined)
+            self._quarantined.clear()
+        for request_socket in sockets:
+            try:
+                request_socket.close()
+            except OSError:
+                pass
+        try:
+            self._on_stopped()
+        except Exception:
+            pass
+
+    def _run_command(self, command: _ControlCommand) -> None:
+        request = command.request
+        if command.cancelled.is_set() or self._shutdown:
+            self._on_not_sent(request, "请求在发送前被取消", RequestStatus.NOT_SENT)
+            return
+        request_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            request_socket.bind((REAL_RALLY_HOST, 0))
+            request_socket.settimeout(0.05)
+        except Exception:
+            request_socket.close()
+            raise
+        if command.cancelled.is_set() or self._shutdown:
+            request_socket.close()
+            self._on_not_sent(request, "请求在发送前被取消", RequestStatus.NOT_SENT)
+            return
+        if self._before_send is not None:
+            allowed, reason = self._before_send(request, time.monotonic_ns())
+            if not allowed:
+                request_socket.close()
+                self._on_not_sent(request, reason, RequestStatus.NOT_SENT)
+                return
+        try:
+            request_socket.sendto(
+                request.command.encode("utf-8"),
+                (self.endpoint.host, self.endpoint.port),
+            )
+        except OSError as exc:
+            request_socket.close()
+            self._on_not_sent(
+                request,
+                f"Rally UDP sendto 失败，结果未知：{exc}",
+                RequestStatus.UNKNOWN,
+            )
+            return
+        command.sent = True
+        with self._condition:
+            self._quarantined.append(request_socket)
+            timeout = self._timeout_seconds
+        sent_ns = time.monotonic_ns()
+        self._on_sent(request, sent_ns)
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._shutdown:
+                self._on_outcome(
+                    request,
+                    RallyControlOutcome(
+                        RequestStatus.UNKNOWN,
+                        "应用关闭时请求已发送但未获确认，结果未知",
+                        sent_monotonic_ns=sent_ns,
+                    ),
+                )
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._on_outcome(
+                    request,
+                    RallyControlOutcome(
+                        RequestStatus.UNKNOWN,
+                        "Rally 响应超时；不自动重发，结果未知",
+                        sent_monotonic_ns=sent_ns,
+                    ),
+                )
+                return
+            request_socket.settimeout(min(0.05, remaining))
+            try:
+                data, source = request_socket.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                self._on_outcome(
+                    request,
+                    RallyControlOutcome(
+                        RequestStatus.UNKNOWN,
+                        f"Rally 等待响应时 socket 关闭，结果未知：{exc}",
+                        sent_monotonic_ns=sent_ns,
+                    ),
+                )
+                return
+            source_host, source_port = str(source[0]), int(source[1])
+            if source_host != REAL_RALLY_HOST:
+                self._on_diagnostic(
+                    f"忽略非本机 Rally 响应来源 {source_host}:{source_port}"
+                )
+                continue
+            parsed = parse_rally_control_response(request.command, data)
+            self._on_outcome(
+                request,
+                RallyControlOutcome(
+                    parsed.status,
+                    parsed.message,
+                    parsed.raw_text,
+                    parsed.raw_bytes,
+                    source_host,
+                    source_port,
+                    sent_ns,
+                    time.monotonic_ns(),
+                ),
+            )
+            return
+
+
+def _validate_positive_timeout(seconds: float) -> None:
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+        or not math.isfinite(float(seconds))
+        or seconds <= 0
+    ):
+        raise ValueError("timeout_seconds 必须是有限正数")
