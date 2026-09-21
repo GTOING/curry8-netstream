@@ -27,6 +27,13 @@ from curry_netstream.protocol import (
     REQUEST_STREAMING_STOP,
 )
 from sleep_stim_controller.controller import ConnectionState, CurrySessionController
+from sleep_stim_controller.rally import (
+    RALLY_START_COMMAND,
+    RALLY_START_SUCCESS,
+    RALLY_STOP_COMMAND,
+    RALLY_STOP_SUCCESS,
+    RallyControlEndpoint,
+)
 
 
 def channel_record(channel_id: int, label: str) -> bytes:
@@ -88,6 +95,7 @@ class SyntheticCurryServer:
         self.accepted = threading.Event()
         self.partial_sent = threading.Event()
         self.release_stream = threading.Event()
+        self.close_stream = threading.Event()
         self.done = threading.Event()
         self._stop = threading.Event()
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -106,6 +114,7 @@ class SyntheticCurryServer:
     def __exit__(self, *exc) -> None:
         self._stop.set()
         self.release_stream.set()
+        self.close_stream.set()
         try:
             self._listener.close()
         finally:
@@ -137,7 +146,12 @@ class SyntheticCurryServer:
                     if header.request == REQUEST_BASIC_INFO:
                         if self.mode == "wait_basic":
                             continue
-                        if self.mode == "onnx_staging":
+                        if self.mode in {
+                            "onnx_staging",
+                            "onnx_staging_hold",
+                            "onnx_staging_eof",
+                            "onnx_staging_eof_hold",
+                        }:
                             payload = struct.pack(
                                 BASIC_INFO_FORMAT, 24, 1, 100, 4, 1, 1
                             )
@@ -151,7 +165,12 @@ class SyntheticCurryServer:
                     elif header.request == REQUEST_CHANNEL_INFO:
                         if self.mode == "wait_channel":
                             continue
-                        if self.mode == "onnx_staging":
+                        if self.mode in {
+                            "onnx_staging",
+                            "onnx_staging_hold",
+                            "onnx_staging_eof",
+                            "onnx_staging_eof_hold",
+                        }:
                             payload = channel_record(1, "Fpz-Cz")
                         else:
                             payload = (
@@ -163,7 +182,14 @@ class SyntheticCurryServer:
                         )
                     elif header.request == REQUEST_STREAMING_START:
                         self._send_stream(connection)
-                        if self.mode in {"eof", "short_packets_eof"}:
+                        if self.mode == "onnx_staging_eof_hold":
+                            self.close_stream.wait(5.0)
+                        if self.mode in {
+                            "eof",
+                            "short_packets_eof",
+                            "onnx_staging_eof",
+                            "onnx_staging_eof_hold",
+                        }:
                             return
                     elif header.request == REQUEST_STREAMING_STOP:
                         return
@@ -174,7 +200,12 @@ class SyntheticCurryServer:
             self.done.set()
 
     def _block_frame(self, start_sample: int, n_samples: int = 300) -> bytes:
-        if self.mode == "onnx_staging":
+        if self.mode in {
+            "onnx_staging",
+            "onnx_staging_hold",
+            "onnx_staging_eof",
+            "onnx_staging_eof_hold",
+        }:
             n_samples = 3000
             timeline = np.arange(n_samples, dtype=np.float32) / 100.0
             values = (
@@ -221,7 +252,17 @@ class SyntheticCurryServer:
             connection.sendall(self._nonfinite_block_frame())
             return
         first = self._block_frame(self.sample_origin)
-        step = 3000 if self.mode == "onnx_staging" else 300
+        step = (
+            3000
+            if self.mode
+            in {
+                "onnx_staging",
+                "onnx_staging_hold",
+                "onnx_staging_eof",
+                "onnx_staging_eof_hold",
+            }
+            else 300
+        )
         second = self._block_frame(self.sample_origin + step)
         if self.mode == "fragmented":
             for part in (first[:7], first[7:20], first[20:53], first[53:]):
@@ -234,6 +275,8 @@ class SyntheticCurryServer:
             connection.sendall(self._block_frame(self.sample_origin + 301))
             return
         if self.mode == "hold_blocks":
+            self.release_stream.wait(5.0)
+        if self.mode in {"onnx_staging_hold", "onnx_staging_eof_hold"}:
             self.release_stream.wait(5.0)
         if self.mode == "many_blocks":
             for index in range(8):
@@ -256,6 +299,57 @@ class SyntheticCurryServer:
             return
         connection.sendall(first)
         connection.sendall(second)
+
+
+class SyntheticBinaryRally:
+    """Random-port binary Rally fixture for the P4-B end-to-end test."""
+
+    def __init__(self, replies: list[bytes | None]) -> None:
+        self._replies = list(replies)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self.requests: list[tuple[bytes, tuple[str, int]]] = []
+        self.request_changed = threading.Event()
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.bind(("127.0.0.1", 0))
+        self._socket.settimeout(0.05)
+        self.endpoint = RallyControlEndpoint("127.0.0.1", self._socket.getsockname()[1])
+        self._thread = threading.Thread(target=self._run, name="synthetic-rally")
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                data, source = self._socket.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with self._lock:
+                self.requests.append((bytes(data), (str(source[0]), int(source[1]))))
+                reply = self._replies.pop(0) if self._replies else None
+            self.request_changed.set()
+            if reply is not None:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as responder:
+                    responder.bind(("127.0.0.1", 0))
+                    responder.sendto(reply, source)
+
+    def wait_for_count(self, count: int, timeout: float = 2.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                if len(self.requests) >= count:
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.request_changed.wait(remaining)
+            self.request_changed.clear()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._socket.close()
+        self._thread.join(1.0)
 
 
 def wait_until(qapp, predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
@@ -1658,3 +1752,281 @@ def test_p3_window_exit_records_inflight_request_as_unknown_before_session_finis
         window.close()
         runtime.shutdown()
         assert wait_until(qapp, lambda: runtime.join(0.01))
+
+
+def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
+    qapp, tmp_path
+) -> None:
+    import json
+
+    from sleep_stim_controller.app import build_application
+    from sleep_stim_controller.recording import SessionReader
+    from sleep_stim_controller.staging import ModelDescriptor, StagePrediction
+
+    class FixtureOnnxAdapter:
+        descriptor = ModelDescriptor(
+            "onnx-sleep-staging:synthetic",
+            "sha256:synthetic",
+            is_test_double=False,
+            confidence_meaning="synthetic probability for contract wiring",
+        )
+
+        def prepare(self, cancel_event):
+            return None
+
+        def predict(self, context, data, cancel_event):
+            return StagePrediction("N2", 0.8)
+
+        def close(self, cancel_event):
+            return None
+
+    rally = SyntheticBinaryRally(
+        [
+            RALLY_STOP_SUCCESS.encode("utf-8"),
+            RALLY_START_SUCCESS.encode("utf-8"),
+            RALLY_STOP_SUCCESS.encode("utf-8"),
+        ]
+    )
+    application, window, controller = build_application(
+        model_factory=FixtureOnnxAdapter,
+        request_timeout_seconds=0.2,
+        rally_control_endpoint=rally.endpoint,
+    )
+    runtime = window._p3_runtime
+    window.show()
+    server = None
+    try:
+        window.set_recording_root(str(tmp_path))
+        window.recording_checkbox.setChecked(True)
+        window.rally_mode_combo.setCurrentIndex(1)
+        window.stage_checkboxes["N2"].setChecked(True)
+        window.stimulation_strategy_combo.setCurrentIndex(1)
+        window.min_interval_edit.setText("0")
+        window.max_result_age_edit.setText("5")
+        window._request_stimulation_configuration()
+
+        server = SyntheticCurryServer("onnx_staging_hold")
+        server.__enter__()
+        window.host_edit.setText("127.0.0.1")
+        window.port_spin.setValue(server.port)
+        window.connect_button.click()
+        assert wait_until(qapp, lambda: controller.state is ConnectionState.STREAMING)
+        window.real_control_confirm_checkbox.setChecked(True)
+        window.stimulation_auto_checkbox.setChecked(True)
+        assert wait_until(qapp, lambda: runtime.real_status["baseline_ready"]), (
+            runtime.real_status,
+            runtime.config,
+            window.stimulation_auto_status_label.text(),
+            window.error_label.text(),
+        )
+        server.release_stream.set()
+        assert wait_until(
+            qapp,
+            lambda: (
+                len(rally.requests) >= 2
+                and runtime.real_status["confirmed_state"] == "RUNNING"
+            ),
+        ), (
+            runtime.real_status,
+            controller.state,
+            controller.latest_processing,
+            server.requests if server is not None else None,
+            server.done.is_set() if server is not None else None,
+            controller.assembly_snapshot,
+            controller.diagnostics_text(),
+            window.stimulation_auto_status_label.text(),
+            window.error_label.text(),
+            [item[0] for item in rally.requests],
+        )
+        assert [item[0] for item in rally.requests[:2]] == [
+            RALLY_STOP_COMMAND.encode("utf-8"),
+            RALLY_START_COMMAND.encode("utf-8"),
+        ]
+        assert wait_until(
+            qapp, lambda: "RUNNING" in window.rally_control_status_label.text()
+        )
+        assert "RUNNING" in window.rally_control_status_label.text()
+        assert "自动控制=开" in window.rally_control_status_label.text()
+
+        window.disconnect_button.click()
+        assert wait_until(
+            qapp,
+            lambda: controller.resources_released() and len(rally.requests) >= 3,
+        )
+        assert [item[0] for item in rally.requests[:3]] == [
+            RALLY_STOP_COMMAND.encode("utf-8"),
+            RALLY_START_COMMAND.encode("utf-8"),
+            RALLY_STOP_COMMAND.encode("utf-8"),
+        ]
+        session_path = Path(controller.session_path)
+        reader = SessionReader(session_path)
+        phases = [event["payload"]["phase"] for event in reader.control_events]
+        assert phases[0] == "config"
+        assert phases[-2:] == ["sent", "outcome"]
+        assert [
+            event["payload"]["command"]
+            for event in reader.control_events
+            if event["payload"]["phase"] == "sent"
+        ] == [RALLY_STOP_COMMAND, RALLY_START_COMMAND, RALLY_STOP_COMMAND]
+        journal = [
+            json.loads(line)
+            for line in (session_path / "events.jsonl").read_text("utf-8").splitlines()
+        ]
+        last_control_sequence = max(
+            event["sequence"]
+            for event in journal
+            if event["event_type"] == "rally_control"
+        )
+        finish_sequence = next(
+            event["sequence"]
+            for event in journal
+            if event["event_type"] == "session_finished"
+        )
+        assert last_control_sequence < finish_sequence
+        assert json.loads((session_path / "manifest.json").read_text("utf-8"))["status"] == "closed"
+    finally:
+        if controller.is_busy():
+            controller.disconnect()
+            assert wait_until(qapp, lambda: controller.resources_released())
+        window.close()
+        runtime.shutdown()
+        assert wait_until(qapp, lambda: runtime.join(0.01))
+        if server is not None:
+            server.__exit__(None, None, None)
+        rally.close()
+
+
+def test_p4b_natural_tcp_eof_registers_stop_before_writer_close(qapp, tmp_path) -> None:
+    """A peer EOF registers real Stop before ProcessingPipeline closes its writer."""
+    import json
+
+    from sleep_stim_controller.app import build_application
+    from sleep_stim_controller.recording import SessionReader
+    from sleep_stim_controller.staging import ModelDescriptor, StagePrediction
+
+    class FixtureOnnxAdapter:
+        descriptor = ModelDescriptor(
+            "onnx-sleep-staging:synthetic-eof",
+            "sha256:synthetic-eof",
+            is_test_double=False,
+            confidence_meaning="synthetic probability for contract wiring",
+        )
+
+        def prepare(self, cancel_event):
+            return None
+
+        def predict(self, context, data, cancel_event):
+            return StagePrediction("N2", 0.8)
+
+        def close(self, cancel_event):
+            return None
+
+    rally = SyntheticBinaryRally(
+        [
+            RALLY_STOP_SUCCESS.encode("utf-8"),
+            RALLY_START_SUCCESS.encode("utf-8"),
+            RALLY_STOP_SUCCESS.encode("utf-8"),
+        ]
+    )
+    application, window, controller = build_application(
+        model_factory=FixtureOnnxAdapter,
+        request_timeout_seconds=0.2,
+        rally_control_endpoint=rally.endpoint,
+    )
+    runtime = window._p3_runtime
+    window.show()
+    server = None
+    try:
+        window.set_recording_root(str(tmp_path))
+        window.recording_checkbox.setChecked(True)
+        window.rally_mode_combo.setCurrentIndex(1)
+        window.stage_checkboxes["N2"].setChecked(True)
+        window.stimulation_strategy_combo.setCurrentIndex(1)
+        window.min_interval_edit.setText("0")
+        window.max_result_age_edit.setText("5")
+        window._request_stimulation_configuration()
+
+        server = SyntheticCurryServer("onnx_staging_eof_hold")
+        server.__enter__()
+        window.host_edit.setText("127.0.0.1")
+        window.port_spin.setValue(server.port)
+        window.connect_button.click()
+        assert wait_until(qapp, lambda: controller.state is ConnectionState.STREAMING)
+        window.real_control_confirm_checkbox.setChecked(True)
+        window.stimulation_auto_checkbox.setChecked(True)
+        assert wait_until(qapp, lambda: runtime.real_status["baseline_ready"])
+
+        server.release_stream.set()
+        assert wait_until(
+            qapp,
+            lambda: (
+                len(rally.requests) >= 2
+                and runtime.real_status["confirmed_state"] == "RUNNING"
+            ),
+        )
+
+        # Let the synthetic Curry peer close its TCP socket. This path does
+        # not click the GUI disconnect button; the network worker owns EOF.
+        server.close_stream.set()
+        assert wait_until(
+            qapp,
+            lambda: (
+                server.done.is_set()
+                and controller.resources_released()
+                and len(rally.requests) >= 3
+            ),
+        )
+        assert [item[0] for item in rally.requests[:3]] == [
+            RALLY_STOP_COMMAND.encode("utf-8"),
+            RALLY_START_COMMAND.encode("utf-8"),
+            RALLY_STOP_COMMAND.encode("utf-8"),
+        ]
+
+        session_path = Path(controller.session_path)
+        reader = SessionReader(session_path)
+        assert [
+            event["payload"]["phase"] for event in reader.control_events
+        ] == [
+            "config",
+            "sent",
+            "outcome",
+            "decision",
+            "sent",
+            "outcome",
+            "decision",
+            "sent",
+            "outcome",
+        ]
+        journal = [
+            json.loads(line)
+            for line in (session_path / "events.jsonl")
+            .read_text("utf-8")
+            .splitlines()
+        ]
+        control_sequences = [
+            event["sequence"]
+            for event in journal
+            if event["event_type"] == "rally_control"
+        ]
+        finish_sequence = next(
+            event["sequence"]
+            for event in journal
+            if event["event_type"] == "session_finished"
+        )
+        assert control_sequences and max(control_sequences) < finish_sequence
+        assert reader.session_finished_payload is not None
+        # Curry reports a peer EOF as a failed/incomplete network session;
+        # the relevant closeout guarantee is that all accepted control events
+        # still precede this truthful final status.
+        assert reader.session_finished_payload["status"] == "failed"
+        assert not controller.is_busy()
+    finally:
+        if controller.is_busy():
+            controller.disconnect()
+            assert wait_until(qapp, lambda: controller.resources_released())
+        window.close()
+        runtime.shutdown()
+        assert wait_until(qapp, lambda: runtime.join(0.01))
+        if server is not None:
+            server.__exit__(None, None, None)
+        rally.close()

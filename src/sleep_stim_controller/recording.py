@@ -20,6 +20,7 @@ from .staging import (
     ProcessingResult,
     utc_now_iso,
 )
+from .rally_control_schema import validate_rally_control_event
 
 
 SCHEMA_VERSION = 1
@@ -166,7 +167,9 @@ class SessionWriter:
         block_id = event.get("block_id")
         request_id = event.get("request_id")
         payload = event.get("payload")
-        if event_type not in {
+        if event_type == "rally_control":
+            validate_rally_control_event(event)
+        elif event_type not in {
             "stimulation_config",
             "decision",
             "request_sent",
@@ -187,7 +190,7 @@ class SessionWriter:
             raise ValueError("附加会话事件 payload 必须是对象")
         if event_type == "stimulation_config" and block_id is not None:
             raise ValueError("stimulation_config 不应关联 EEG block")
-        if event_type != "stimulation_config" and block_id is None:
+        if event_type not in {"stimulation_config", "rally_control"} and block_id is None:
             raise ValueError(f"{event_type} 必须关联 EEG block")
         try:
             json.dumps(payload, ensure_ascii=False, allow_nan=False)
@@ -314,6 +317,7 @@ class ReplayOverview:
     block_count: int
     incomplete: bool
     issues: tuple[str, ...]
+    control_events: tuple[dict[str, Any], ...] = ()
 
 
 class SessionReader:
@@ -340,6 +344,7 @@ class SessionReader:
             raise SessionFormatError("manifest 来源或 recording_enabled 标记无效")
         self.manifest = manifest
         self.session_finished_payload: dict[str, Any] | None = None
+        self.control_events: tuple[dict[str, Any], ...] = ()
         self.issues: list[str] = []
         self.incomplete = manifest.get("status") == "recording"
         if manifest.get("status") not in {"recording", "closed", "failed"}:
@@ -364,6 +369,7 @@ class SessionReader:
             block_count=len(self.entries),
             incomplete=self.incomplete,
             issues=tuple(self.issues),
+            control_events=self.control_events,
         )
 
     def _read_event_index(self) -> tuple[ReplayBlockEntry, ...]:
@@ -381,6 +387,7 @@ class SessionReader:
         results: dict[int, dict[str, Any]] = {}
         stimulation_events: dict[int, list[dict[str, Any]]] = {}
         stimulation_configs: dict[int, dict[str, Any]] = {}
+        control_events: list[dict[str, Any]] = []
         decisions_by_request: dict[str, dict[str, Any]] = {}
         sent_requests: set[str] = set()
         request_outcomes: set[str] = set()
@@ -421,6 +428,22 @@ class SessionReader:
                 )
             block_id = event.get("block_id")
             payload = event.get("payload")
+            if event_type == "rally_control":
+                try:
+                    validate_rally_control_event(event)
+                except ValueError as exc:
+                    raise SessionFormatError(
+                        f"events.jsonl 第 {line_number} 行 Rally 控制事件无效：{exc}"
+                    ) from exc
+                if event.get("session_id") != self.manifest.get("session_id"):
+                    raise SessionFormatError(
+                        f"events.jsonl 第 {line_number} 行 Rally 控制事件 session_id 不匹配"
+                    )
+                event_copy = dict(event)
+                control_events.append(event_copy)
+                if isinstance(event.get("block_id"), int):
+                    stimulation_events.setdefault(int(event["block_id"]), []).append(event_copy)
+                continue
             if event_type == "block_saved":
                 if (
                     not isinstance(block_id, int)
@@ -709,6 +732,7 @@ class SessionReader:
                 self.incomplete = True
                 self.issues.append("manifest processing_results 计数与事件索引不一致")
         self.session_finished_payload = finish_payload
+        self.control_events = tuple(control_events)
         return tuple(entries)
 
     def _entry_from_event(

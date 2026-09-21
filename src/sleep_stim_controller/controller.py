@@ -276,16 +276,17 @@ class CurrySessionController(QObject):
             self._fatal_error = None
             self._state = ConnectionState.CONNECTING
             self._progress_timer.start()
-
+            effective_model_factory = (
+                model_factory if model_factory is not None else self._model_factory
+            )
+            model_configured = effective_model_factory is not NoModelAdapter
             pipeline = ProcessingPipeline(
                 session_id=session_id,
                 host=host,
                 port=int(port),
                 recording_enabled=recording_enabled,
                 recording_root=recording_root,
-                model_factory=(
-                    model_factory if model_factory is not None else self._model_factory
-                ),
+                model_factory=effective_model_factory,
                 pending_limit=self._pending_block_limit,
                 on_ready=lambda error: self._pipeline_ready_signal.emit(
                     generation, error
@@ -294,7 +295,13 @@ class CurrySessionController(QObject):
                     generation, result
                 ),
                 on_stimulation_result=(
-                    self._stimulation_runtime.process_block
+                    (
+                        lambda context, result, current_generation=generation: (
+                            self._stimulation_runtime.process_block(
+                                context, result, generation=current_generation
+                            )
+                        )
+                    )
                     if self._stimulation_runtime is not None
                     else None
                 ),
@@ -313,7 +320,11 @@ class CurrySessionController(QObject):
             self._pipeline = pipeline
             if self._stimulation_runtime is not None:
                 self._stimulation_runtime.begin_session(
-                    session_id, pipeline, recording_enabled
+                    session_id,
+                    pipeline,
+                    recording_enabled,
+                    generation=generation,
+                    model_configured=model_configured,
                 )
 
         self.busy_changed.emit(True)
@@ -573,6 +584,14 @@ class CurrySessionController(QObject):
             except (OSError, ValueError) as exc:
                 if not cancelled and error is None:
                     error = exc
+            if self._stimulation_runtime is not None:
+                # Natural EOF and network failures must register the real
+                # control shutdown from this worker before the pipeline is
+                # allowed to pass its final handoff barrier.  The Qt callback
+                # below repeats this idempotently as a lifecycle fallback.
+                self._stimulation_runtime.on_session_stopping(
+                    "接收结束；自动决策已关闭"
+                )
             assembly = self._finalize_assembly(generation)
             if pipeline is not None:
                 pipeline.handoff_network_end(
@@ -640,6 +659,8 @@ class CurrySessionController(QObject):
             pipeline = self._pipeline
         if pipeline is not None:
             pipeline.set_session_info(session)
+        if self._stimulation_runtime is not None:
+            self._stimulation_runtime.set_session_ready(True)
         self.session_changed.emit(session)
         self.assembly_progress_changed.emit(assembler.snapshot())
         self.diagnostics_changed.emit(self.diagnostics_text())
@@ -757,6 +778,8 @@ class CurrySessionController(QObject):
 
     @Slot()
     def _flush_assembly_progress(self) -> None:
+        if self._stimulation_runtime is not None:
+            self._stimulation_runtime.tick()
         with self._lock:
             if not self._assembly_progress_dirty:
                 return

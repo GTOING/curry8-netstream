@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from .controller import CurrySessionController
 from .onnx_staging import OnnxSleepStagingAdapter
 from .replay import SessionReplayWorker
-from .rally import LoopbackRallySimulator
+from .rally import LoopbackRallySimulator, RallyControlEndpoint, RallyControlTransportWorker
 from .staging import ModelAdapter, NoModelAdapter
 from .stimulation_runtime import StimulationRuntime
 from .ui import MainWindow
@@ -41,6 +41,8 @@ def build_application(
     model_factory: Callable[[], ModelAdapter] | None = None,
     simulator_factory: Callable[[], LoopbackRallySimulator] = LoopbackRallySimulator,
     request_timeout_seconds: float = 1.0,
+    rally_control_endpoint: RallyControlEndpoint | None = None,
+    real_transport_factory: Callable[..., RallyControlTransportWorker] | None = None,
 ) -> tuple[QApplication, MainWindow, CurrySessionController]:
     application = QApplication.instance()
     if application is None:
@@ -50,6 +52,16 @@ def build_application(
         window,
         request_timeout_seconds=request_timeout_seconds,
         simulator_factory=simulator_factory,
+        **(
+            {"rally_control_endpoint": rally_control_endpoint}
+            if rally_control_endpoint is not None
+            else {}
+        ),
+        **(
+            {"real_transport_factory": real_transport_factory}
+            if real_transport_factory is not None
+            else {}
+        ),
     )
     controller = CurrySessionController(
         model_factory=(model_factory if model_factory is not None else NoModelAdapter),
@@ -101,6 +113,7 @@ def build_application(
     controller.recording_changed.connect(window.set_recording_status)
     stimulation.simulator_status_changed.connect(window.set_simulator_status)
     stimulation.automatic_status_changed.connect(window.set_stimulation_auto_status)
+    stimulation.rally_status_changed.connect(window.set_rally_status)
     stimulation.decision_changed.connect(window.set_stimulation_decision)
     stimulation.request_changed.connect(window.set_stimulation_request)
     stimulation.activity_changed.connect(window.set_p3_background_busy)
@@ -140,6 +153,18 @@ def build_application(
     window.simulator_start_requested.connect(start_simulator)
     window.simulator_stop_requested.connect(stimulation.stop_simulator)
     window.request_timeout_changed.connect(update_request_timeout)
+
+    def change_rally_mode(mode: str) -> None:
+        try:
+            if not stimulation.set_control_mode(mode):
+                window.set_rally_mode(stimulation.control_mode)
+                window.set_error("控制模式切换正在等待当前 Rally/模拟请求收尾")
+                return
+            window.set_error("")
+        except (TypeError, ValueError, RuntimeError) as exc:
+            window.set_error(f"控制模式未更改：{exc}")
+
+    window.rally_mode_requested.connect(change_rally_mode)
 
     def choose_replay_directory() -> None:
         if controller.is_busy():
@@ -183,6 +208,7 @@ def build_application(
             return
         replay_state["overview"] = overview
         window.set_replay_ready(overview)
+        window.set_replay_control_events(getattr(overview, "control_events", ()))
         if overview.block_count:
             request_replay_block(0)
         elif overview.incomplete:

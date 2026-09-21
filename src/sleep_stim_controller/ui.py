@@ -103,6 +103,7 @@ class MainWindow(QMainWindow):
     replay_index_requested = Signal(int)
     stimulation_configuration_changed = Signal(object)
     stimulation_auto_requested = Signal(bool)
+    rally_mode_requested = Signal(str)
     simulator_start_requested = Signal()
     simulator_stop_requested = Signal()
     request_timeout_changed = Signal(float)
@@ -129,9 +130,11 @@ class MainWindow(QMainWindow):
         self._p3_auto_enabled = False
         self._p3_simulator_active = False
         self._p3_replay_events: tuple[dict, ...] = ()
+        self._p3_replay_control_events: tuple[dict, ...] = ()
         self._p3_session_id: str | None = None
         self._p3_protocol: ProtocolScheme | None = None
         self._p3_recent: list[str] = []
+        self._rally_mode = "simulation"
 
         toolbar = QToolBar("程序信息")
         toolbar.setMovable(False)
@@ -349,7 +352,8 @@ class MainWindow(QMainWindow):
         stimulation_layout = QVBoxLayout(self.stimulation_section.content)
         stimulation_layout.setContentsMargins(4, 4, 4, 4)
         self.stimulation_warning_label = QLabel(
-            "仅模拟，真实刺激未接入。配置不代表已核实真机限制或实验参数。"
+            "仅模拟，真实刺激未接入（当前默认状态）。真实模式只控制 Rally 已加载协议，"
+            "不选择或修改刺激参数。"
         )
         self.stimulation_warning_label.setWordWrap(True)
         self.stimulation_warning_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -357,6 +361,25 @@ class MainWindow(QMainWindow):
             "color: #9a3412; font-weight: 600;"
         )
         stimulation_layout.addWidget(self.stimulation_warning_label)
+
+        mode_row = QHBoxLayout()
+        self.rally_mode_combo = QComboBox()
+        self.rally_mode_combo.setObjectName("rallyControlMode")
+        self.rally_mode_combo.addItem("本机模拟（P3）", "simulation")
+        self.rally_mode_combo.addItem(
+            "真实 Rally（127.0.0.1:8801；默认关闭）", "real"
+        )
+        self.rally_mode_combo.currentIndexChanged.connect(self._request_rally_mode)
+        mode_row.addWidget(QLabel("控制模式"))
+        mode_row.addWidget(self.rally_mode_combo, 1)
+        stimulation_layout.addLayout(mode_row)
+
+        self.rally_mode_hint_label = QLabel(
+            "真实模式要求操作者先在 Rally 中加载并检查协议；软件确认只表示收到 API 回复。"
+        )
+        self.rally_mode_hint_label.setObjectName("rallyModeHint")
+        self.rally_mode_hint_label.setWordWrap(True)
+        stimulation_layout.addWidget(self.rally_mode_hint_label)
 
         stage_row = QHBoxLayout()
         self.stage_checkboxes: dict[str, QCheckBox] = {}
@@ -449,12 +472,28 @@ class MainWindow(QMainWindow):
             self._request_automatic_decision
         )
         stimulation_layout.addWidget(self.stimulation_auto_checkbox)
+        self.real_control_confirm_checkbox = QCheckBox(
+            "我确认 Rally 当前已加载并检查协议；启用真实自动控制"
+        )
+        self.real_control_confirm_checkbox.setObjectName("realRallyConfirmation")
+        self.real_control_confirm_checkbox.setChecked(False)
+        self.real_control_confirm_checkbox.toggled.connect(
+            self._request_stimulation_configuration
+        )
+        stimulation_layout.addWidget(self.real_control_confirm_checkbox)
         self.stimulation_auto_status_label = QLabel(
             "自动决策关闭；正常 NoModel 模式不会产生请求。"
         )
         self.stimulation_auto_status_label.setObjectName("stimulationAutoStatus")
         self.stimulation_auto_status_label.setWordWrap(True)
         stimulation_layout.addWidget(self.stimulation_auto_status_label)
+
+        self.rally_control_status_label = QLabel(
+            "Rally 控制状态：DISARMED/UNKNOWN · 尚未启用真实模式"
+        )
+        self.rally_control_status_label.setObjectName("rallyControlStatus")
+        self.rally_control_status_label.setWordWrap(True)
+        stimulation_layout.addWidget(self.rally_control_status_label)
 
         self.stimulation_recent_label = QLabel("尚无实时或回放刺激决策事件")
         self.stimulation_recent_label.setObjectName("stimulationRecentEvents")
@@ -660,9 +699,60 @@ class MainWindow(QMainWindow):
             return
         self.request_timeout_changed.emit(value)
 
+    @Slot(int)
+    def _request_rally_mode(self, _index: int) -> None:
+        mode = str(self.rally_mode_combo.currentData() or "simulation")
+        self._rally_mode = mode
+        self._update_rally_mode_copy(mode)
+        self.stimulation_auto_checkbox.setText(
+            "启用真实 Rally 自动控制（需明确确认）"
+            if mode == "real"
+            else "启用自动决策（仅发送至本应用模拟端）"
+        )
+        self.rally_mode_requested.emit(mode)
+        self._update_stimulation_controls()
+
+    def set_rally_mode(self, mode: str) -> None:
+        normalized = "real" if str(mode).strip().lower() == "real" else "simulation"
+        index = self.rally_mode_combo.findData(normalized)
+        if index < 0:
+            return
+        self.rally_mode_combo.blockSignals(True)
+        self.rally_mode_combo.setCurrentIndex(index)
+        self.rally_mode_combo.blockSignals(False)
+        self._rally_mode = normalized
+        self._update_rally_mode_copy(normalized)
+        self.stimulation_auto_checkbox.setText(
+            "启用真实 Rally 自动控制（需明确确认）"
+            if normalized == "real"
+            else "启用自动决策（仅发送至本应用模拟端）"
+        )
+        self._update_stimulation_controls()
+
+    def _update_rally_mode_copy(self, mode: str) -> None:
+        if mode == "real":
+            self.stimulation_warning_label.setText(
+                "真实 Rally 模式：只控制 Rally 当前已加载协议，不选择或修改刺激参数；"
+                "API 确认不等于物理输出确认。"
+            )
+        else:
+            self.stimulation_warning_label.setText(
+                "仅模拟，真实刺激未接入（当前默认状态）。真实模式只控制 Rally 已加载协议，"
+                "不选择或修改刺激参数。"
+            )
+
     @Slot(bool)
     def _request_automatic_decision(self, enabled: bool) -> None:
         if enabled:
+            if self._rally_mode == "real" and not self.real_control_confirm_checkbox.isChecked():
+                self.stimulation_auto_checkbox.blockSignals(True)
+                self.stimulation_auto_checkbox.setChecked(False)
+                self.stimulation_auto_checkbox.blockSignals(False)
+                self.set_stimulation_auto_status(
+                    False,
+                    "真实 Rally 控制未启用：请先勾选明确确认，并确保 Rally 已加载并检查协议。",
+                )
+                return
             try:
                 config = self.stimulation_configuration()
             except ValueError as exc:
@@ -680,6 +770,46 @@ class MainWindow(QMainWindow):
         self.stimulation_auto_status_label.setText(detail)
         self._update_stimulation_controls()
 
+    @Slot(object)
+    def set_rally_status(self, status: dict) -> None:
+        if not isinstance(status, dict):
+            return
+        mode = status.get("mode", self._rally_mode)
+        enabled = bool(status.get("enabled", False))
+        runtime_state = status.get("runtime_state", "DISARMED/UNKNOWN")
+        expected = status.get("expected_state") or "—"
+        desired = status.get("desired_state") or "—"
+        confirmed = status.get("confirmed_state") or "未知"
+        last_request = status.get("last_request") or {}
+        last_outcome = status.get("last_outcome") or {}
+        independent = bool(status.get("independent_stop_required", False))
+        endpoint = status.get("endpoint") or "未知"
+        request_text = "无"
+        if isinstance(last_request, dict):
+            request_text = (
+                f"{last_request.get('command', '?')} / "
+                f"{last_request.get('status', '?')}"
+            )
+        outcome_text = "无"
+        if isinstance(last_outcome, dict):
+            outcome_text = (
+                f"{last_outcome.get('command', '?')} / "
+                f"{last_outcome.get('status', '?')} / "
+                f"{last_outcome.get('raw_text') or last_outcome.get('message', '')}"
+            )
+        detail = (
+            f"Rally 控制状态：{runtime_state} · 自动控制={'开' if enabled else '关'} · "
+            f"端点={endpoint}\n"
+            f"期望={expected} · 最新期望={desired} · 最近确认={confirmed}\n"
+            f"最近请求={request_text}\n最近回复={outcome_text}"
+        )
+        if independent:
+            detail += "\n⚠ 未获得停止确认：请在 Rally/硬件侧独立停止。"
+        if mode == "simulation":
+            detail = "Rally 控制状态：模拟模式；真实端点不会发送\n" + detail
+        self.rally_control_status_label.setText(detail)
+        self._update_stimulation_controls()
+
     @Slot(bool, str)
     def set_simulator_status(self, active: bool, detail: str) -> None:
         self._p3_simulator_active = active
@@ -694,24 +824,43 @@ class MainWindow(QMainWindow):
         )
         for checkbox in self.stage_checkboxes.values():
             checkbox.setEnabled(editable)
-        for widget in (
-            self.stimulation_strategy_combo,
-            self.min_interval_edit,
-            self.max_result_age_edit,
-            self.request_timeout_edit,
-            self.choose_protocol_button,
-        ):
-            widget.setEnabled(editable)
+        self.stimulation_strategy_combo.setEnabled(editable)
+        self.min_interval_edit.setEnabled(editable)
+        self.max_result_age_edit.setEnabled(editable)
+        self.request_timeout_edit.setEnabled(editable)
+        self.choose_protocol_button.setEnabled(
+            editable and self._rally_mode == "simulation"
+        )
+        simulation_widgets_visible = self._rally_mode == "simulation"
+        self.choose_protocol_button.setVisible(simulation_widgets_visible)
+        self.protocol_summary_label.setVisible(simulation_widgets_visible)
+        self.simulator_start_button.setVisible(simulation_widgets_visible)
+        self.simulator_stop_button.setVisible(simulation_widgets_visible)
+        self.simulator_status_label.setVisible(simulation_widgets_visible)
+        self.rally_mode_combo.setEnabled(
+            not self._p3_auto_enabled
+            and not self._replay_mode
+            and not self._p3_close_requested
+            and not self._busy
+        )
+        self.real_control_confirm_checkbox.setEnabled(
+            self._rally_mode == "real"
+            and not self._p3_auto_enabled
+            and not self._replay_mode
+            and not self._p3_close_requested
+        )
         self.stimulation_auto_checkbox.setEnabled(
             not self._replay_mode and not self._p3_close_requested
         )
         self.simulator_start_button.setEnabled(
             not self._p3_simulator_active
+            and self._rally_mode == "simulation"
             and not self._replay_mode
             and not self._p3_close_requested
         )
         self.simulator_stop_button.setEnabled(
             self._p3_simulator_active
+            and self._rally_mode == "simulation"
             and not self._replay_mode
             and not self._p3_close_requested
         )
@@ -727,6 +876,8 @@ class MainWindow(QMainWindow):
             return
         if decision.session_id != self._p3_session_id:
             return
+        if self._rally_mode == "real":
+            return
         verdict = "候选允许（仅模拟）" if decision.allowed else "抑制"
         model = decision.model
         marker = " · 测试替身" if decision.test_double else ""
@@ -741,6 +892,14 @@ class MainWindow(QMainWindow):
     def set_stimulation_request(self, update: dict) -> None:
         if self._replay_mode or self._p3_session_id is None:
             return
+        if update.get("mode") == "real":
+            source = update.get("response_source") or "未确认来源"
+            self._append_stimulation_recent(
+                f"实时 Rally {update.get('command', '?')} · "
+                f"{update.get('status', '?')} · {update.get('message', '')} · "
+                f"来源 {source}"
+            )
+            return
         request_id = update.get("request_id", "?")
         status = update.get("status", "?")
         self._append_stimulation_recent(
@@ -753,6 +912,9 @@ class MainWindow(QMainWindow):
             self._p3_recent.clear()
             self.stimulation_recent_label.setText("尚无实时或回放刺激决策事件")
         self._p3_session_id = session_id
+        self.real_control_confirm_checkbox.blockSignals(True)
+        self.real_control_confirm_checkbox.setChecked(False)
+        self.real_control_confirm_checkbox.blockSignals(False)
         self.session_id_label.setText(f"当前会话：{session_id}")
 
     def set_replay_stimulation_events(self, events: Sequence[dict]) -> None:
@@ -761,7 +923,7 @@ class MainWindow(QMainWindow):
         self.stimulation_recent_label.setText("此回放块尚无已记录的刺激事件")
         self._p3_replay_events = tuple(events)
         self._p3_recent.clear()
-        for event in events:
+        for event in (*self._p3_replay_control_events, *events):
             event_type = event.get("event_type")
             payload = event.get("payload", {})
             block_id = event.get("block_id", "?")
@@ -784,9 +946,23 @@ class MainWindow(QMainWindow):
                     f"回放 block={block_id} 请求结果={payload.get('status', '?')} · "
                     f"{payload.get('message', '')}"
                 )
+            elif event_type == "rally_control":
+                phase = payload.get("phase", "?")
+                detail = (
+                    f"回放 Rally phase={phase} · {payload.get('command') or '配置/无命令'} · "
+                    f"{payload.get('outcome', '?')} · 仅展示，不发送"
+                )
             else:
                 continue
             self._append_stimulation_recent(detail)
+
+    def set_replay_control_events(self, events: Sequence[dict]) -> None:
+        if not self._replay_mode:
+            return
+        self._p3_replay_control_events = tuple(
+            event for event in events if event.get("block_id") is None
+        )
+        self.set_replay_stimulation_events(self._p3_replay_events)
 
     def set_recording_root(self, path: str) -> None:
         self.recording_root_label.setProperty("path", path)
@@ -951,6 +1127,7 @@ class MainWindow(QMainWindow):
             self._handshake_ready = False
             self._p3_session_id = None
             self._p3_replay_events = ()
+            self._p3_replay_control_events = ()
             self._p3_recent.clear()
             self.stimulation_recent_label.setText("此回放块尚无已记录的刺激事件")
             self.block_metadata_label.setText("等待离线回放数据块")
