@@ -61,7 +61,7 @@ uv run --locked sleep-stim-controller
 
 ## P3 睡眠期策略与 P4-B Rally 启停控制
 
-“睡眠期决策与本机模拟”面板默认五期未选、策略/间隔/最大结果年龄未配置、自动决策关闭、模拟端未启动。控制模式默认是本机模拟；真实模式必须单独选择、勾选明确确认，并且只允许当前实时握手、显式 ONNX 和完整配置。NoModel、回放和离线状态不会产生真实请求。界面区分期望状态、在途请求、最近确认状态和 `FAULT/UNKNOWN`；“UDP 已发送”不等于设备已启动或已停止。
+“睡眠期决策与本机模拟”面板默认五期未选、策略/间隔/最大结果年龄未配置、自动决策关闭、模拟端未启动。控制模式默认是本机模拟；真实模式必须单独选择、勾选“协议已加载并检查且当前未进行刺激”的明确确认，并且只允许当前实时握手、显式 ONNX 和完整配置。NoModel、回放和离线状态不会产生真实请求。界面区分 ARMED/IDLE、期望状态、在途请求、操作者确认、API 最近确认和 `FAULT/UNKNOWN`；“UDP 已发送”不等于设备已启动或已停止。
 
 本机模拟联调时，先配置一个或多个目标期、明确选择策略、填写最小请求间隔和最大结果年龄，再选择经过校验的本地模拟协议 JSON；之后显式启动本应用模拟端并开启自动决策。间隔允许 `0`，结果年龄必须大于 `0`；两者没有预置实验值。模拟通信超时默认 `1` 秒，可调整，它只用于本机联调，不代表真机 SLA。模拟器仅绑定 `127.0.0.1` 的随机空闲 UDP 端口，不使用 `8801`。
 
@@ -69,9 +69,11 @@ uv run --locked sleep-stim-controller
 
 模拟策略只处理当前实时会话中成功且期别合法的模型结果，并逐块记录允许/抑制原因；重复/倒序块、过期结果、间隔或在途占用会抑制请求，不排队补发。模拟 API 应答只表示假端点返回结果。
 
-真实模式操作当前已由 Rally 人工加载的协议，不读取、选择或修改刺激参数。每次显式启用先发送 `Stop Stim` 基线；只有精确收到 `停止刺激成功` 或兼容字符串 `RALLY_ERROR_SUCCESS` 后，下一条新的合格 ONNX 结果才可请求 `Start Stim`。目标期请求 `Start Stim`，非目标期请求 `Stop Stim`；同向重复结果不重复发送。GUI 周期 tick 会按已配置的最大结果年龄处理静默流，真正 `sendto` 前还会复核当前 session、armed、基线和缓存年龄，Stop 等待期间变旧的结果不能再次启动。命令是 UTF-8 二值报文，成功文本按命令区分，回复只接受来自 `127.0.0.1` 的动态源端口并记录实际来源；普通 Start 受隔离 socket 上限约束，并保留一次 Stop/启动不确定补偿容量。启动拒绝/未知/超时不重试启动，只进行一次有界补偿停止；停止失败进入 `FAULT/UNKNOWN`，操作者必须在 Rally/硬件侧独立停止。应用被关闭、断流或当前模型失败时也走一次停止收尾，但操作系统异常或进程被杀不能保证停止。
+真实模式操作当前已由 Rally 人工加载的协议，不读取、选择或修改刺激参数。显式启用只进入 `ARMED/IDLE` 并记录操作者确认，零 UDP；清掉启用前结果资格，只有启用后的新合格 ONNX 结果才可请求控制。目标期请求 `Start Stim`，非目标期在 IDLE/STOPPED 时 no-op、在 RUNNING 时请求 `Stop Stim`；同向重复结果不重复发送。GUI 周期 tick 会按已配置的最大结果年龄处理静默流，真正 `sendto` 前还会复核当前 session、armed 和缓存年龄，过期结果不能再次启动。只有已发送 Start 的收尾责任或已确认 RUNNING 才会在关闭/故障/EOF/退出时触发必要 Stop；未发送/取消的 Start 不补 Stop。命令是 UTF-8 二值报文，成功文本按命令区分，回复只接受来自 `127.0.0.1` 的动态源端口并记录实际来源；普通 Start 受隔离 socket 上限约束，并保留一次 Stop/启动不确定补偿容量。启动拒绝/未知/超时不重试启动，只进行一次有界补偿停止；停止失败进入 `FAULT/UNKNOWN`，操作者必须在 Rally/硬件侧独立停止。API 确认不等于物理输出确认；操作系统异常或进程被杀不能保证停止。
 
-P4-B 控制事件使用现有 session 单写者的 `rally_control` schema v1；基线和退出停止允许没有 EEG block。普通 external-work 在 pipeline 收尾/记录故障后仍被拒绝，必要 Stop 使用独立控制租约覆盖最终 outcome 和补偿停止；自然 TCP EOF/网络异常由网络 worker 在 `handoff_network_end` 前先登记 runtime 收尾，稍后的 Qt 回调只作幂等兜底。pipeline 在 condition 锁内完成最终事件排空与新租约关闭的原子转换；磁盘不可写时继续尽力发送并报告控制证据缺失，不虚报记录成功；可写会话的 `session_finished` 在最后控制事件之后写入。保存关闭时只保留内存/UI 状态，保存开启时回放器展示第一块前、块间和最后一块后的历史控制事件，绝不重发。详见 [P4-B Rally 控制合同](docs/P4B_RALLY_CONTROL_CONTRACT.md)。本轮截图 [P4-B 800×600 合成证据](reports/P4B_RALLY_START_STOP_800X600.png) 明确来自随机 loopback 假端点，不是 Rally 实机证据。
+P4-B/Issue 5 控制事件使用现有 session 单写者的 `rally_control` schema v1；启用确认、无命令决策和退出停止允许没有 EEG block。普通 external-work 在 pipeline 收尾/记录故障后仍被拒绝，必要 Stop 使用独立控制租约覆盖最终 outcome 和补偿停止；自然 TCP EOF/网络异常由网络 worker 在 `handoff_network_end` 前先登记 runtime 收尾，稍后的 Qt 回调只作幂等兜底。pipeline 在 condition 锁内完成最终事件排空与新租约关闭的原子转换；磁盘不可写时继续尽力发送并报告控制证据缺失，不虚报记录成功；可写会话的 `session_finished` 在最后控制事件之后写入。保存关闭时只保留内存/UI 状态，保存开启时回放器展示启用、块间和退出后的历史控制事件，绝不重发。详见 [Issue 5 arming 合同](docs/ISSUE5_RALLY_ARMING_CONTRACT.md) 与 [P4-B Rally 控制合同](docs/P4B_RALLY_CONTROL_CONTRACT.md)。本轮截图 [P4-B 800×600 合成证据](reports/P4B_RALLY_START_STOP_800X600.png) 明确来自随机 loopback 假端点，不是 Rally 实机证据。
+
+Issue 6 增加独立选择的“版本化范式（Start + Apply）”模式：操作者加载范式包并核对当前 Rally 基础协议后，W→A、N1→B、N2→C，N3/REM 触发必要 Stop；只有 Start 与 Apply 均获精确 API 成功回复才显示目标协议已确认。包冻结在本 session 内并随记录保存完整规范快照与哈希，回放只展示。仓库中的 A/B/C 仅为 `synthetic/test-only` fixture；没有生产范式包，真实参数、单位换算和设备限制未批准。Issue 提到的 FR=30 与短暂基础输出时间窗仍是实验假设，不能作为安全参数或硬件时限；本次没有 Windows、Rally、8801、COM 或物理输出验证。操作说明见 [Issue 6 GUI 与范式包指南](docs/ISSUE6_PARADIGM_GUI_GUIDE.md) 和 [Issue 6 工程合同](docs/ISSUE6_PARADIGM_CONTRACT.md)。
 
 UDP 协议没有请求 ID，因此每个请求使用独立临时来源端口；该端口在本应用模拟端关闭前保持隔离，迟到或重复响应不能匹配到下一条命令。超时、无法解释的响应或 API 拒绝都不会重试；超时/无法关联记为 `unknown`，未知或拒绝会关闭自动决策。若启用 P2 记录，配置快照、决策、`request_sent` 与 `request_outcome` 由 P2 单写者按序追加，且在 `session_finished` 前收口。旧 P1/P2 schema v1 会话格式保持兼容；回放只展示已记录事件，不运行策略、不启动通信。
 
@@ -95,6 +97,9 @@ QT_QPA_PLATFORM=offscreen uv run --locked pytest
 - [目录整理记录](reports/2026-09-15_development_layout.md)
 - [P4 接入准备操作手册](docs/P4_INTEGRATION_RUNBOOK.md)
 - [P4-B Rally 启停控制合同](docs/P4B_RALLY_CONTROL_CONTRACT.md)
+- [Issue 5 Rally arming 修复合同](docs/ISSUE5_RALLY_ARMING_CONTRACT.md)
+- [Issue 6 GUI 与范式包指南](docs/ISSUE6_PARADIGM_GUI_GUIDE.md)
+- [Issue 6 版本化多协议范式合同](docs/ISSUE6_PARADIGM_CONTRACT.md)
 - [ONNX 睡眠分期合同](docs/P_MODEL_ONNX_CONTRACT.md)
 - [P4-A 原生排障报告](reports/P4A_NATIVE_READINESS_REPORT.md)
 - [P-GUI 界面整理报告](reports/P_GUI_REPORT.md)

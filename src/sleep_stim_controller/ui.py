@@ -104,6 +104,8 @@ class MainWindow(QMainWindow):
     stimulation_configuration_changed = Signal(object)
     stimulation_auto_requested = Signal(bool)
     rally_mode_requested = Signal(str)
+    rally_profile_requested = Signal(str)
+    paradigm_package_requested = Signal(str)
     simulator_start_requested = Signal()
     simulator_stop_requested = Signal()
     request_timeout_changed = Signal(float)
@@ -135,6 +137,8 @@ class MainWindow(QMainWindow):
         self._p3_protocol: ProtocolScheme | None = None
         self._p3_recent: list[str] = []
         self._rally_mode = "simulation"
+        self._rally_profile = "binary"
+        self._paradigm_package_summary = "未选择范式包；范式模式默认关闭"
 
         toolbar = QToolBar("程序信息")
         toolbar.setMovable(False)
@@ -374,6 +378,26 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self.rally_mode_combo, 1)
         stimulation_layout.addLayout(mode_row)
 
+        profile_row = QHBoxLayout()
+        self.rally_profile_combo = QComboBox()
+        self.rally_profile_combo.setObjectName("rallyProtocolProfile")
+        self.rally_profile_combo.addItem("二值启停（现有协议）", "binary")
+        self.rally_profile_combo.addItem("版本化范式（Start + Apply）", "paradigm")
+        self.rally_profile_combo.currentIndexChanged.connect(self._request_rally_profile)
+        profile_row.addWidget(QLabel("真实协议配置"))
+        profile_row.addWidget(self.rally_profile_combo, 1)
+        stimulation_layout.addLayout(profile_row)
+
+        paradigm_row = QHBoxLayout()
+        self.choose_paradigm_button = QPushButton("选择范式包目录…")
+        self.choose_paradigm_button.setObjectName("chooseParadigmPackage")
+        self.choose_paradigm_button.clicked.connect(self._choose_paradigm_package)
+        self.paradigm_package_summary_label = PathSummary(self._paradigm_package_summary)
+        self.paradigm_package_summary_label.setObjectName("paradigmPackageSummary")
+        paradigm_row.addWidget(self.choose_paradigm_button)
+        paradigm_row.addWidget(self.paradigm_package_summary_label, 1)
+        stimulation_layout.addLayout(paradigm_row)
+
         self.rally_mode_hint_label = QLabel(
             "真实模式要求操作者先在 Rally 中加载并检查协议；软件确认只表示收到 API 回复。"
         )
@@ -473,7 +497,7 @@ class MainWindow(QMainWindow):
         )
         stimulation_layout.addWidget(self.stimulation_auto_checkbox)
         self.real_control_confirm_checkbox = QCheckBox(
-            "我确认 Rally 当前已加载并检查协议；启用真实自动控制"
+            "我确认 Rally 已加载并检查协议，且当前未进行刺激；启用真实自动控制"
         )
         self.real_control_confirm_checkbox.setObjectName("realRallyConfirmation")
         self.real_control_confirm_checkbox.setChecked(False)
@@ -489,7 +513,7 @@ class MainWindow(QMainWindow):
         stimulation_layout.addWidget(self.stimulation_auto_status_label)
 
         self.rally_control_status_label = QLabel(
-            "Rally 控制状态：DISARMED/UNKNOWN · 尚未启用真实模式"
+            "Rally 控制状态：DISARMED/UNKNOWN · 操作者确认=否 · 尚未启用真实模式"
         )
         self.rally_control_status_label.setObjectName("rallyControlStatus")
         self.rally_control_status_label.setWordWrap(True)
@@ -710,7 +734,62 @@ class MainWindow(QMainWindow):
             else "启用自动决策（仅发送至本应用模拟端）"
         )
         self.rally_mode_requested.emit(mode)
+        self._update_rally_profile_copy()
         self._update_stimulation_controls()
+
+    def _request_rally_profile(self, _index: int) -> None:
+        profile = str(self.rally_profile_combo.currentData() or "binary")
+        self._rally_profile = profile
+        self.rally_profile_requested.emit(profile)
+        self._update_rally_profile_copy()
+        self._update_stimulation_controls()
+
+    def _choose_paradigm_package(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "选择包含 paradigm.json 的范式包目录")
+        if selected:
+            self.paradigm_package_requested.emit(selected)
+
+    def set_rally_profile(self, profile: str) -> None:
+        normalized = "paradigm" if str(profile).strip().lower() == "paradigm" else "binary"
+        self._rally_profile = normalized
+        self.rally_profile_combo.blockSignals(True)
+        self.rally_profile_combo.setCurrentIndex(
+            max(0, self.rally_profile_combo.findData(normalized))
+        )
+        self.rally_profile_combo.blockSignals(False)
+        self._update_rally_profile_copy()
+        self._update_stimulation_controls()
+
+    def set_paradigm_package_summary(
+        self,
+        path: str,
+        *,
+        name: str,
+        version: str,
+        sha256: str,
+        classification: str,
+    ) -> None:
+        self.paradigm_package_summary_label.setText(
+            f"{path}\n{name} · {version} · {classification}\nSHA-256 {sha256}"
+        )
+
+    def _update_rally_profile_copy(self) -> None:
+        if self._rally_profile == "paradigm":
+            self.stimulation_auto_checkbox.setText(
+                "启用范式自动控制（Start + 最新协议 Apply；需人工确认）"
+            )
+            self.real_control_confirm_checkbox.setText(
+                "我已核对 Rally 基础协议与所选范式包，且当前未刺激；申请范式自动控制"
+            )
+        else:
+            self.stimulation_auto_checkbox.setText(
+                "启用真实 Rally 自动控制（需明确确认）"
+                if self._rally_mode == "real"
+                else "启用自动决策（仅发送至本应用模拟端）"
+            )
+            self.real_control_confirm_checkbox.setText(
+                "我确认 Rally 已加载并检查协议，且当前未进行刺激；启用真实自动控制"
+            )
 
     def set_rally_mode(self, mode: str) -> None:
         normalized = "real" if str(mode).strip().lower() == "real" else "simulation"
@@ -722,11 +801,13 @@ class MainWindow(QMainWindow):
         self.rally_mode_combo.blockSignals(False)
         self._rally_mode = normalized
         self._update_rally_mode_copy(normalized)
+        self._update_rally_profile_copy()
         self.stimulation_auto_checkbox.setText(
             "启用真实 Rally 自动控制（需明确确认）"
             if normalized == "real"
             else "启用自动决策（仅发送至本应用模拟端）"
         )
+        self._update_rally_profile_copy()
         self._update_stimulation_controls()
 
     def _update_rally_mode_copy(self, mode: str) -> None:
@@ -750,15 +831,16 @@ class MainWindow(QMainWindow):
                 self.stimulation_auto_checkbox.blockSignals(False)
                 self.set_stimulation_auto_status(
                     False,
-                    "真实 Rally 控制未启用：请先勾选明确确认，并确保 Rally 已加载并检查协议。",
+                    "真实 Rally 控制未启用：请先确认协议已加载并检查，且当前未进行刺激。",
                 )
                 return
-            try:
-                config = self.stimulation_configuration()
-            except ValueError as exc:
-                self.set_stimulation_auto_status(False, f"配置输入无效：{exc}")
-                return
-            self.stimulation_configuration_changed.emit(config)
+            if not (self._rally_mode == "real" and self._rally_profile == "paradigm"):
+                try:
+                    config = self.stimulation_configuration()
+                except ValueError as exc:
+                    self.set_stimulation_auto_status(False, f"配置输入无效：{exc}")
+                    return
+                self.stimulation_configuration_changed.emit(config)
         self.stimulation_auto_requested.emit(enabled)
 
     @Slot(bool, str)
@@ -783,7 +865,21 @@ class MainWindow(QMainWindow):
         last_request = status.get("last_request") or {}
         last_outcome = status.get("last_outcome") or {}
         independent = bool(status.get("independent_stop_required", False))
+        operator_confirmed = bool(status.get("operator_confirmed", False))
+        start_responsibility = bool(status.get("start_sent_responsibility", False))
         endpoint = status.get("endpoint") or "未知"
+        profile = str(status.get("profile") or "binary")
+        if profile in {"binary", "paradigm"} and profile != self._rally_profile:
+            self.set_rally_profile(profile)
+        desired_protocol = status.get("latest_desired_protocol") or "无"
+        confirmed_protocol = status.get("api_confirmed_protocol") or "未知"
+        package = ""
+        if status.get("paradigm_name"):
+            package = (
+                f"\n范式={status.get('paradigm_name')}@{status.get('paradigm_version')} "
+                f"· {status.get('paradigm_classification')}"
+            )
+        expiry = status.get("estimated_expiry_utc")
         request_text = "无"
         if isinstance(last_request, dict):
             request_text = (
@@ -800,9 +896,17 @@ class MainWindow(QMainWindow):
         detail = (
             f"Rally 控制状态：{runtime_state} · 自动控制={'开' if enabled else '关'} · "
             f"端点={endpoint}\n"
-            f"期望={expected} · 最新期望={desired} · 最近确认={confirmed}\n"
+            f"操作者确认未刺激={'是' if operator_confirmed else '否'} · "
+            f"Start 收尾责任={'有' if start_responsibility else '无'}\n"
+            f"期望={expected} · 最新期望={desired} · API最近确认={confirmed}\n"
             f"最近请求={request_text}\n最近回复={outcome_text}"
+            f"{package}"
         )
+        if profile == "paradigm":
+            detail += (
+                f"\n范式 latest desired={desired_protocol} · API confirmed={confirmed_protocol}"
+                f"\n估计到期={expiry or '不可估计'} · 物理输出确认=否"
+            )
         if independent:
             detail += "\n⚠ 未获得停止确认：请在 Rally/硬件侧独立停止。"
         if mode == "simulation":
@@ -831,6 +935,13 @@ class MainWindow(QMainWindow):
         self.choose_protocol_button.setEnabled(
             editable and self._rally_mode == "simulation"
         )
+        self.rally_profile_combo.setEnabled(
+            editable and self._rally_mode == "real" and not self._busy
+        )
+        self.choose_paradigm_button.setEnabled(
+            editable and self._rally_profile == "paradigm"
+        )
+        self.paradigm_package_summary_label.setVisible(self._rally_profile == "paradigm")
         simulation_widgets_visible = self._rally_mode == "simulation"
         self.choose_protocol_button.setVisible(simulation_widgets_visible)
         self.protocol_summary_label.setVisible(simulation_widgets_visible)
@@ -946,10 +1057,17 @@ class MainWindow(QMainWindow):
                     f"回放 block={block_id} 请求结果={payload.get('status', '?')} · "
                     f"{payload.get('message', '')}"
                 )
-            elif event_type == "rally_control":
+            elif event_type in {"rally_control", "paradigm_control"}:
                 phase = payload.get("phase", "?")
+                label = (
+                    f"范式 {payload.get('action') or payload.get('operation') or '配置'}"
+                    if event_type == "paradigm_control"
+                    else payload.get("command") or "配置/无命令"
+                )
                 detail = (
-                    f"回放 Rally phase={phase} · {payload.get('command') or '配置/无命令'} · "
+                    f"回放 Rally phase={phase} · {label} · "
+                    f"期望={payload.get('desired_protocol') or payload.get('desired_state') or '无'} · "
+                    f"API确认={payload.get('api_confirmed_protocol') or payload.get('confirmed_state') or '未知'} · "
                     f"{payload.get('outcome', '?')} · 仅展示，不发送"
                 )
             else:
@@ -960,7 +1078,10 @@ class MainWindow(QMainWindow):
         if not self._replay_mode:
             return
         self._p3_replay_control_events = tuple(
-            event for event in events if event.get("block_id") is None
+            event
+            for event in events
+            if event.get("block_id") is None
+            and event.get("event_type") in {"rally_control", "paradigm_control"}
         )
         self.set_replay_stimulation_events(self._p3_replay_events)
 

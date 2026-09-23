@@ -2,6 +2,8 @@
 
 版本：1（2026-09-21）
 
+2026-09-22 后续变更：启用基线 Stop 与收尾 Stop 条件已由 [Issue 5 合同](ISSUE5_RALLY_ARMING_CONTRACT.md)替代并实现；其余规则继续有效。以下保留 P4B 原合同作为历史基线，当前实现以 Issue 5 为准。
+
 本合同描述控制器对 Rally 当前已加载协议的二值启停联动。它不选择、上传或修改刺激范式，不声明模型准确性、物理输出或受试者安全性。真实模式默认关闭；P4-B 自动化证据只使用随机 loopback 假端点。
 
 ## 1. 模式和资格
@@ -21,15 +23,16 @@
 
 - `enabled`：本次真实自动控制是否 armed；
 - `expected_state` / `desired_state`：保护性策略当前希望 Rally 处于 `RUNNING` 或 `STOPPED`；
-- `runtime_state`：`DISARMED/UNKNOWN`、`STOPPED`、`STARTING`、`RUNNING`、`STOPPING`、`FAULT/UNKNOWN`；
+- `runtime_state`：`DISARMED/UNKNOWN`、`ARMED/IDLE`、`STOPPED`、`STARTING`、`RUNNING`、`STOPPING`、`FAULT/UNKNOWN`；
 - `confirmed_state`：只有精确成功回复可以更新的最近 Rally 协议确认；失败或超时后不会沿用它冒充当前确认，GUI 会同时显示 `FAULT/UNKNOWN`；
 - `confirmed_utc`、请求/回复时间、回复来源、关联 block/model：用于追溯，不是统一硬件时钟。
+- `operator_confirmed`：操作者已确认协议已加载、已检查且当前未进行刺激；它不是 API 或物理确认。
 
-显式启用的第一步永远是一次 `Stop Stim` 基线。基线成功后进入 `STOPPED`，并丢弃基线在途期间收到的结果；只有之后新的合格结果才可控制。基线失败/超时不允许 `Start Stim`。
+当前启用只记录操作者确认并进入 `ARMED/IDLE`，零 UDP；不会伪造 `STOPPED` 的 API 成功或 `confirmed_utc`。启用前缓存的结果资格会清掉，只有启用后的新合格结果可控制。
 
-当前实时、当前 generation、`SUCCESS`、标签属于 `W/N1/N2/N3/REM`、模型标识为非测试 ONNX、接收/处理时间有限、结果未超过已配置最大年龄且块号严格递增，才是合格结果。目标期集合内映射到 `RUNNING`/`Start Stim`，非目标期映射到 `STOPPED`/`Stop Stim`。重复同向结果、重复 block 和倒序 block 是 no-op；一个请求在途时只保留最新期望状态，不建立无界队列。Stop 优先于 Start；未发送的 Start 可取消，已发送的 Start 必须等有限结果后再进行一次 Stop 收尾。现有 GUI 周期调度会调用显式 `tick()` 检查“没有新结果”的年龄；真正 `sendto` 前 worker 还会重新核对当前 session/generation、armed、基线和缓存年龄，过期缓存不能在等待 Stop 后再次启动。
+当前实时、当前 generation、`SUCCESS`、标签属于 `W/N1/N2/N3/REM`、模型标识为非测试 ONNX、接收/处理时间有限、结果未超过已配置最大年龄且块号严格递增，才是合格结果。目标期集合内映射到 `RUNNING`/`Start Stim`，非目标期映射到 `STOPPED`/`Stop Stim`。IDLE/STOPPED + 非目标期是 no-op；重复同向结果、重复 block 和倒序 block 是 no-op；一个请求在途时只保留最新期望状态，不建立无界队列。Stop 优先于 Start；未发送或取消的 Start 不产生收尾责任，已到达发送边界并成功 `sendto` 的 Start 必须等有限结果后再收尾。现有 GUI 周期调度会调用显式 `tick()` 检查“没有新结果”的年龄；真正 `sendto` 前 worker 还会重新核对当前 session/generation、armed 和缓存年龄，过期缓存不能再次启动。
 
-当前会话模型失败/不可用、块序缺口、结果过期、Curry 停止/断流、用户关闭自动控制、窗口关闭或应用退出会解除 armed 状态。若没有明确 `STOPPED` 确认，则最多发一次保护性 `Stop Stim`。Start 拒绝、未知或超时不重试 Start，只发一次有界补偿 Stop。Stop 拒绝、未知或超时进入 `FAULT/UNKNOWN`，不循环重试，提示操作者在 Rally/硬件侧独立停止。操作系统异常、强制杀进程和设备自身故障不由软件保证停止。
+当前会话模型失败/不可用、块序缺口、结果过期、Curry 停止/断流、用户关闭自动控制、窗口关闭或应用退出会解除 armed 状态。只有已确认 `RUNNING` 或已发送 Start 的未解决责任才触发一次必要 Stop；确认 `STOPPED` 或没有发送证据的 IDLE/Start 取消不发 Stop。Start 拒绝、未知或超时不重试 Start，只发一次有界补偿 Stop；Stop 拒绝、未知或超时进入 `FAULT/UNKNOWN`，不循环重试，提示操作者在 Rally/硬件侧独立停止。重复勾选不能清空未解决责任或复用旧确认。操作系统异常、强制杀进程和设备自身故障不由软件保证停止。
 
 ## 3. UDP wire 和隔离
 
@@ -78,7 +81,7 @@ GUI/分期线程不执行阻塞 `recv`。worker 一次最多持有一个 pending
 }
 ```
 
-`phase=config` 使用 `command=null`，通常没有 `request_id`；`phase=decision` 可表示 no-op，因此 command/request id 可以为 null；`phase=sent` 和 `phase=outcome` 必须有非空 request id 和 `Start Stim`/`Stop Stim` command。`block_id` 可以为 null，尤其是基线、补偿停止、保护性停止、退出和配置事件；若有关联结果则使用真实正整数 block id，不制造 `0`。`stage` 是合法睡眠期或 null；`model` 为模型 descriptor 或 null；`target_stages` 是合法标签数组，可为空。
+`phase=config` 使用 `command=null`，通常没有 `request_id`；`phase=decision` 可表示 no-op，因此 command/request id 可以为 null；`phase=sent` 和 `phase=outcome` 必须有非空 request id 和 `Start Stim`/`Stop Stim` command。`block_id` 可以为 null，尤其是补偿停止、保护性停止、退出和配置事件；若有关联结果则使用真实正整数 block id，不制造 `0`。`stage` 是合法睡眠期或 null；`model` 为模型 descriptor 或 null；`target_stages` 是合法标签数组，可为空。
 
 `response` 在有回复时包含：
 
@@ -96,6 +99,6 @@ GUI/分期线程不执行阻塞 `recv`。worker 一次最多持有一个 pending
 
 ## 5. 回放和验收边界
 
-`SessionReader` 接受可选 `rally_control` 事件，并将无 block 的事件保存在 session-level `control_events`，有关联 block 的事件同时挂在该 `ReplayBlockEntry`。因此第一块前的基线、块间决策/回复和最后一块后的退出停止都能展示；没有 EEG block 的空会话也能展示。回放 worker 只读文件，绝不创建 Rally transport、发送命令、重跑模型或运行策略。
+`SessionReader` 接受可选 `rally_control` 事件，并将无 block 的事件保存在 session-level `control_events`，有关联 block 的事件同时挂在该 `ReplayBlockEntry`。因此启用确认、无命令 no-op、块间决策/回复和最后一块后的退出停止都能展示；没有 EEG block 的空会话也能展示。回放 worker 只读文件，绝不创建 Rally transport、发送命令、重跑模型或运行策略。
 
-P4-B 自动化只证明代码路径、随机 loopback wire、状态机、记录/回放顺序和 GUI 状态。它不证明 Rally 实机回复、刺激物理输出、设备安全、模型效果、跨设备时钟同步或受试者实验；这些必须以后在单独授权和独立停止路径可用的条件下进行。
+P4-B/Issue 5 自动化只证明代码路径、随机 loopback wire、arming/收尾责任状态机、记录/回放顺序和 GUI 状态。它不证明 Rally 实机回复、刺激物理输出、设备安全、模型效果、跨设备时钟同步或受试者实验；这些必须以后在单独授权和独立停止路径可用的条件下进行。

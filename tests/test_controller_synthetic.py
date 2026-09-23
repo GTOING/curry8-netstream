@@ -151,6 +151,8 @@ class SyntheticCurryServer:
                             "onnx_staging_hold",
                             "onnx_staging_eof",
                             "onnx_staging_eof_hold",
+                            "issue6_paradigm_hold",
+                            "issue6_paradigm_eof_hold",
                         }:
                             payload = struct.pack(
                                 BASIC_INFO_FORMAT, 24, 1, 100, 4, 1, 1
@@ -170,8 +172,15 @@ class SyntheticCurryServer:
                             "onnx_staging_hold",
                             "onnx_staging_eof",
                             "onnx_staging_eof_hold",
+                            "issue6_paradigm_hold",
+                            "issue6_paradigm_eof_hold",
                         }:
-                            payload = channel_record(1, "Fpz-Cz")
+                            label = (
+                                "TEST_EEG_A"
+                                if self.mode.startswith("issue6_paradigm_")
+                                else "Fpz-Cz"
+                            )
+                            payload = channel_record(1, label)
                         else:
                             payload = (
                                 channel_record(1, "C3")
@@ -182,13 +191,17 @@ class SyntheticCurryServer:
                         )
                     elif header.request == REQUEST_STREAMING_START:
                         self._send_stream(connection)
-                        if self.mode == "onnx_staging_eof_hold":
+                        if self.mode in {
+                            "onnx_staging_eof_hold",
+                            "issue6_paradigm_eof_hold",
+                        }:
                             self.close_stream.wait(5.0)
                         if self.mode in {
                             "eof",
                             "short_packets_eof",
                             "onnx_staging_eof",
                             "onnx_staging_eof_hold",
+                            "issue6_paradigm_eof_hold",
                         }:
                             return
                     elif header.request == REQUEST_STREAMING_STOP:
@@ -205,6 +218,8 @@ class SyntheticCurryServer:
             "onnx_staging_hold",
             "onnx_staging_eof",
             "onnx_staging_eof_hold",
+            "issue6_paradigm_hold",
+            "issue6_paradigm_eof_hold",
         }:
             n_samples = 3000
             timeline = np.arange(n_samples, dtype=np.float32) / 100.0
@@ -260,6 +275,8 @@ class SyntheticCurryServer:
                 "onnx_staging_hold",
                 "onnx_staging_eof",
                 "onnx_staging_eof_hold",
+                "issue6_paradigm_hold",
+                "issue6_paradigm_eof_hold",
             }
             else 300
         )
@@ -276,7 +293,12 @@ class SyntheticCurryServer:
             return
         if self.mode == "hold_blocks":
             self.release_stream.wait(5.0)
-        if self.mode in {"onnx_staging_hold", "onnx_staging_eof_hold"}:
+        if self.mode in {
+            "onnx_staging_hold",
+            "onnx_staging_eof_hold",
+            "issue6_paradigm_hold",
+            "issue6_paradigm_eof_hold",
+        }:
             self.release_stream.wait(5.0)
         if self.mode == "many_blocks":
             for index in range(8):
@@ -1782,7 +1804,6 @@ def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
 
     rally = SyntheticBinaryRally(
         [
-            RALLY_STOP_SUCCESS.encode("utf-8"),
             RALLY_START_SUCCESS.encode("utf-8"),
             RALLY_STOP_SUCCESS.encode("utf-8"),
         ]
@@ -1805,7 +1826,7 @@ def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
         window.max_result_age_edit.setText("5")
         window._request_stimulation_configuration()
 
-        server = SyntheticCurryServer("onnx_staging_hold")
+        server = SyntheticCurryServer("issue6_paradigm_hold")
         server.__enter__()
         window.host_edit.setText("127.0.0.1")
         window.port_spin.setValue(server.port)
@@ -1813,17 +1834,11 @@ def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
         assert wait_until(qapp, lambda: controller.state is ConnectionState.STREAMING)
         window.real_control_confirm_checkbox.setChecked(True)
         window.stimulation_auto_checkbox.setChecked(True)
-        assert wait_until(qapp, lambda: runtime.real_status["baseline_ready"]), (
-            runtime.real_status,
-            runtime.config,
-            window.stimulation_auto_status_label.text(),
-            window.error_label.text(),
-        )
         server.release_stream.set()
         assert wait_until(
             qapp,
             lambda: (
-                len(rally.requests) >= 2
+                len(rally.requests) >= 1
                 and runtime.real_status["confirmed_state"] == "RUNNING"
             ),
         ), (
@@ -1838,8 +1853,7 @@ def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
             window.error_label.text(),
             [item[0] for item in rally.requests],
         )
-        assert [item[0] for item in rally.requests[:2]] == [
-            RALLY_STOP_COMMAND.encode("utf-8"),
+        assert [item[0] for item in rally.requests[:1]] == [
             RALLY_START_COMMAND.encode("utf-8"),
         ]
         assert wait_until(
@@ -1851,10 +1865,9 @@ def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
         window.disconnect_button.click()
         assert wait_until(
             qapp,
-            lambda: controller.resources_released() and len(rally.requests) >= 3,
+            lambda: controller.resources_released() and len(rally.requests) >= 2,
         )
-        assert [item[0] for item in rally.requests[:3]] == [
-            RALLY_STOP_COMMAND.encode("utf-8"),
+        assert [item[0] for item in rally.requests[:2]] == [
             RALLY_START_COMMAND.encode("utf-8"),
             RALLY_STOP_COMMAND.encode("utf-8"),
         ]
@@ -1867,7 +1880,7 @@ def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
             event["payload"]["command"]
             for event in reader.control_events
             if event["payload"]["phase"] == "sent"
-        ] == [RALLY_STOP_COMMAND, RALLY_START_COMMAND, RALLY_STOP_COMMAND]
+        ] == [RALLY_START_COMMAND, RALLY_STOP_COMMAND]
         journal = [
             json.loads(line)
             for line in (session_path / "events.jsonl").read_text("utf-8").splitlines()
@@ -1884,6 +1897,223 @@ def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
         )
         assert last_control_sequence < finish_sequence
         assert json.loads((session_path / "manifest.json").read_text("utf-8"))["status"] == "closed"
+    finally:
+        if controller.is_busy():
+            controller.disconnect()
+            assert wait_until(qapp, lambda: controller.resources_released())
+        window.close()
+        runtime.shutdown()
+        assert wait_until(qapp, lambda: runtime.join(0.01))
+        if server is not None:
+            server.__exit__(None, None, None)
+        rally.close()
+
+
+def test_issue6_curry_tcp_paradigm_apply_gui_recording_and_readonly_replay(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    import json
+
+    import sleep_stim_controller.app as app_module
+    from sleep_stim_controller.paradigm import load_paradigm_package
+    from sleep_stim_controller.recording import SessionReader
+    from sleep_stim_controller.staging import ModelDescriptor, StagePrediction
+
+    fixture_package = Path(__file__).parent / "fixtures" / "issue6_paradigm_test_only"
+    package_snapshot = load_paradigm_package(fixture_package)
+    selected_replay: dict[str, str] = {}
+
+    def choose_directory(_parent, title, *_args):
+        if title == "选择包含 paradigm.json 的范式包目录":
+            return str(fixture_package)
+        if title == "选择已保存的会话目录":
+            return selected_replay.get("path", "")
+        return str(tmp_path)
+
+    monkeypatch.setattr(
+        "sleep_stim_controller.ui.QFileDialog.getExistingDirectory",
+        choose_directory,
+    )
+    monkeypatch.setattr(
+        "sleep_stim_controller.app.QFileDialog.getExistingDirectory",
+        choose_directory,
+    )
+
+    runtime_type = app_module.StimulationRuntime
+
+    class SyntheticParadigmRuntime(runtime_type):
+        def __init__(self, *args, **kwargs):
+            kwargs["allow_synthetic_paradigm_for_tests"] = True
+            super().__init__(*args, **kwargs)
+
+    # The only synthetic-package arming escape hatch is injected into this
+    # test runtime; the production application keeps the default hard block.
+    monkeypatch.setattr(app_module, "StimulationRuntime", SyntheticParadigmRuntime)
+
+    class FixtureOnnxAdapter:
+        descriptor = ModelDescriptor(
+            "onnx-sleep-staging:issue6-loopback",
+            "sha256:issue6-loopback",
+            is_test_double=False,
+            confidence_meaning="synthetic stage sequence for Issue 6 integration",
+        )
+
+        def __init__(self):
+            self._stages = iter(("W", "N1"))
+
+        def prepare(self, cancel_event):
+            return None
+
+        def predict(self, context, data, cancel_event):
+            return StagePrediction(next(self._stages), 0.91)
+
+        def close(self, cancel_event):
+            return None
+
+    rally = SyntheticBinaryRally(
+        [
+            RALLY_START_SUCCESS.encode("utf-8"),
+            b"RALLY_ERROR_SUCCESS",  # Apply A
+            b"RALLY_ERROR_SUCCESS",  # Apply B
+            RALLY_STOP_SUCCESS.encode("utf-8"),
+        ]
+    )
+    _application, window, controller = app_module.build_application(
+        model_factory=FixtureOnnxAdapter,
+        request_timeout_seconds=0.2,
+        rally_control_endpoint=rally.endpoint,
+    )
+    runtime = window._p3_runtime
+    server = None
+    window.show()
+    try:
+        window.set_recording_root(str(tmp_path))
+        window.recording_checkbox.setChecked(True)
+        window.rally_mode_combo.setCurrentIndex(
+            window.rally_mode_combo.findData("real")
+        )
+        window.rally_profile_combo.setCurrentIndex(
+            window.rally_profile_combo.findData("paradigm")
+        )
+        window.choose_paradigm_button.click()
+        assert runtime.selected_paradigm is not None
+        assert runtime.selected_paradigm.classification == "synthetic/test-only"
+        window.max_result_age_edit.setText("60")
+        window._request_stimulation_configuration()
+
+        server = SyntheticCurryServer("issue6_paradigm_eof_hold")
+        server.__enter__()
+        window.host_edit.setText("127.0.0.1")
+        window.port_spin.setValue(server.port)
+        window.connect_button.click()
+        assert wait_until(qapp, lambda: controller.state is ConnectionState.STREAMING)
+        window.real_control_confirm_checkbox.setChecked(True)
+        window.stimulation_auto_checkbox.setChecked(True)
+        assert runtime.real_status["runtime_state"] == "ARMED/IDLE", (
+            f"{runtime.real_status!r}; profile={runtime.real_profile}; "
+            f"mode={window.rally_mode_combo.currentData()}; "
+            f"confirmation={window.real_control_confirm_checkbox.isChecked()}; "
+            f"auto={window.stimulation_auto_checkbox.isChecked()}; "
+            f"auto_status={window.stimulation_auto_status_label.text()!r}; "
+            f"error={window.error_label.text()!r}"
+        )
+        assert rally.requests == []  # Arming itself emits no datagram.
+
+        server.release_stream.set()
+        assert wait_until(
+            qapp,
+            lambda: rally.wait_for_count(3, timeout=0.01)
+            and runtime.real_status["api_confirmed_protocol"] == "B",
+            timeout=10.0,
+        ), (
+            runtime.real_status,
+            controller.latest_processing,
+            controller.diagnostics_text(),
+            window.rally_control_status_label.text(),
+            [item[0] for item in rally.requests],
+        )
+        wire = [item[0] for item in rally.requests]
+        assert wire[0] == RALLY_START_COMMAND.encode("utf-8")
+        assert wire[1].startswith(b"RealTimeControl ")
+        assert wire[2].startswith(b"RealTimeControl ")
+        assert json.loads(wire[1].partition(b" ")[2]) == package_snapshot.protocol_map[
+            "A"
+        ].payload
+        assert json.loads(wire[2].partition(b" ")[2]) == package_snapshot.protocol_map[
+            "B"
+        ].payload
+        assert wait_until(
+            qapp,
+            lambda: "latest desired=B" in window.rally_control_status_label.text()
+            and "API confirmed=B" in window.rally_control_status_label.text(),
+        )
+        assert "latest desired=B" in window.rally_control_status_label.text()
+        assert "API confirmed=B" in window.rally_control_status_label.text()
+
+        server.close_stream.set()
+        assert wait_until(
+            qapp,
+            lambda: controller.resources_released() and rally.wait_for_count(4, 0.01),
+        )
+        assert rally.requests[3][0] == RALLY_STOP_COMMAND.encode("utf-8")
+        session_path = Path(controller.session_path)
+        reader = SessionReader(session_path)
+        controls = reader.control_events
+        snapshot = controls[0]["payload"]["paradigm_snapshot"]
+        assert controls[0]["payload"]["phase"] == "config"
+        assert snapshot["classification"] == "synthetic/test-only"
+        assert len(snapshot["protocols"]) == 3
+        assert snapshot["protocols"][0]["protocol_canonical_json"]
+        assert "source_directory" not in snapshot
+        assert [
+            event["payload"].get("stage")
+            for event in controls
+            if event["payload"]["phase"] == "decision"
+        ] == ["W", "N1"]
+        sent = [event for event in controls if event["payload"]["phase"] == "sent"]
+        assert [event["payload"]["operation"] for event in sent] == [
+            "start",
+            "apply",
+            "apply",
+            "stop",
+        ]
+
+        journal = [
+            json.loads(line)
+            for line in (session_path / "events.jsonl").read_text("utf-8").splitlines()
+        ]
+        last_control_sequence = max(
+            event["sequence"]
+            for event in journal
+            if event["event_type"] == "paradigm_control"
+        )
+        finish_sequence = next(
+            event["sequence"]
+            for event in journal
+            if event["event_type"] == "session_finished"
+        )
+        assert last_control_sequence < finish_sequence
+
+        selected_replay["path"] = str(session_path)
+        window.open_replay_button.click()
+        assert wait_until(
+            qapp,
+            lambda: "离线回放" in window.data_status_label.text()
+            and "block_id=1" in window.block_metadata_label.text(),
+        )
+        request_count = len(rally.requests)
+        assert "仅展示，不发送" in window.stimulation_recent_label.text()
+        window.replay_next_button.click()
+        assert wait_until(
+            qapp, lambda: "block_id=2" in window.block_metadata_label.text()
+        )
+        assert len(rally.requests) == request_count
+        window.exit_replay_button.click()
+        assert wait_until(
+            qapp,
+            lambda: window.connect_button.isEnabled()
+            and not window._p2_replay_worker.active,
+        )
     finally:
         if controller.is_busy():
             controller.disconnect()
@@ -1923,7 +2153,6 @@ def test_p4b_natural_tcp_eof_registers_stop_before_writer_close(qapp, tmp_path) 
 
     rally = SyntheticBinaryRally(
         [
-            RALLY_STOP_SUCCESS.encode("utf-8"),
             RALLY_START_SUCCESS.encode("utf-8"),
             RALLY_STOP_SUCCESS.encode("utf-8"),
         ]
@@ -1954,13 +2183,12 @@ def test_p4b_natural_tcp_eof_registers_stop_before_writer_close(qapp, tmp_path) 
         assert wait_until(qapp, lambda: controller.state is ConnectionState.STREAMING)
         window.real_control_confirm_checkbox.setChecked(True)
         window.stimulation_auto_checkbox.setChecked(True)
-        assert wait_until(qapp, lambda: runtime.real_status["baseline_ready"])
 
         server.release_stream.set()
         assert wait_until(
             qapp,
             lambda: (
-                len(rally.requests) >= 2
+                len(rally.requests) >= 1
                 and runtime.real_status["confirmed_state"] == "RUNNING"
             ),
         )
@@ -1973,11 +2201,10 @@ def test_p4b_natural_tcp_eof_registers_stop_before_writer_close(qapp, tmp_path) 
             lambda: (
                 server.done.is_set()
                 and controller.resources_released()
-                and len(rally.requests) >= 3
+                and len(rally.requests) >= 2
             ),
         )
-        assert [item[0] for item in rally.requests[:3]] == [
-            RALLY_STOP_COMMAND.encode("utf-8"),
+        assert [item[0] for item in rally.requests[:2]] == [
             RALLY_START_COMMAND.encode("utf-8"),
             RALLY_STOP_COMMAND.encode("utf-8"),
         ]
@@ -1988,8 +2215,6 @@ def test_p4b_natural_tcp_eof_registers_stop_before_writer_close(qapp, tmp_path) 
             event["payload"]["phase"] for event in reader.control_events
         ] == [
             "config",
-            "sent",
-            "outcome",
             "decision",
             "sent",
             "outcome",

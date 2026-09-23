@@ -13,6 +13,7 @@ from .replay import SessionReplayWorker
 from .rally import LoopbackRallySimulator, RallyControlEndpoint, RallyControlTransportWorker
 from .staging import ModelAdapter, NoModelAdapter
 from .stimulation_runtime import StimulationRuntime
+from .paradigm import load_paradigm_package
 from .ui import MainWindow
 
 
@@ -165,6 +166,35 @@ def build_application(
             window.set_error(f"控制模式未更改：{exc}")
 
     window.rally_mode_requested.connect(change_rally_mode)
+
+    def change_rally_profile(profile: str) -> None:
+        try:
+            if not stimulation.set_real_profile(profile):
+                window.set_rally_profile(stimulation.real_profile)
+                window.set_error("协议配置切换等待当前 Rally 收尾完成")
+                return
+            window.set_error("")
+        except (TypeError, ValueError, RuntimeError) as exc:
+            window.set_rally_profile(stimulation.real_profile)
+            window.set_error(f"协议配置未更改：{exc}")
+
+    def select_paradigm_package(directory: str) -> None:
+        try:
+            snapshot = load_paradigm_package(directory)
+            stimulation.select_paradigm(snapshot)
+            window.set_paradigm_package_summary(
+                directory,
+                name=snapshot.name,
+                version=snapshot.version,
+                sha256=snapshot.sha256,
+                classification=snapshot.classification,
+            )
+            window.set_error("")
+        except (OSError, ValueError, RuntimeError) as exc:
+            window.set_error(f"范式包未选择：{exc}")
+
+    window.rally_profile_requested.connect(change_rally_profile)
+    window.paradigm_package_requested.connect(select_paradigm_package)
 
     def choose_replay_directory() -> None:
         if controller.is_busy():

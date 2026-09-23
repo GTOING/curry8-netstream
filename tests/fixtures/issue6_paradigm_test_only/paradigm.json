@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "name": "Issue 6 synthetic paradigm",
+  "version": "test-only-1",
+  "classification": "synthetic/test-only",
+  "decision_strategy": "immediate_each_eligible_epoch",
+  "required_rally_base_protocol": "TEST_BASE_PROTOCOL_ONLY",
+  "model_input_channels": ["TEST_EEG_A"],
+  "stage_mapping": {
+    "W": "A",
+    "N1": "B",
+    "N2": "C",
+    "N3": null,
+    "REM": null
+  },
+  "protocols": {
+    "A": "protocols/A.json",
+    "B": "protocols/B.json",
+    "C": "protocols/C.json"
+  }
+}

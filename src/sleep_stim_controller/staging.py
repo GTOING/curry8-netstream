@@ -416,11 +416,18 @@ class ProcessingPipeline:
         return False
 
     def _validate_session_event(self, event: dict[str, object]) -> bool:
-        if event.get("event_type") == "rally_control":
+        if event.get("event_type") in {"rally_control", "paradigm_control"}:
             try:
-                from .rally_control_schema import validate_rally_control_event
+                if event.get("event_type") == "rally_control":
+                    from .rally_control_schema import validate_rally_control_event
 
-                validate_rally_control_event(event)
+                    validate_rally_control_event(event)
+                else:
+                    from .paradigm_control_schema import (
+                        validate_paradigm_control_event,
+                    )
+
+                    validate_paradigm_control_event(event)
             except (TypeError, ValueError):
                 return False
             return event.get("session_id") == self.session_id

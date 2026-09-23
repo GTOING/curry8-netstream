@@ -21,6 +21,7 @@ from .staging import (
     utc_now_iso,
 )
 from .rally_control_schema import validate_rally_control_event
+from .paradigm_control_schema import validate_paradigm_control_event
 
 
 SCHEMA_VERSION = 1
@@ -169,6 +170,8 @@ class SessionWriter:
         payload = event.get("payload")
         if event_type == "rally_control":
             validate_rally_control_event(event)
+        elif event_type == "paradigm_control":
+            validate_paradigm_control_event(event)
         elif event_type not in {
             "stimulation_config",
             "decision",
@@ -190,7 +193,7 @@ class SessionWriter:
             raise ValueError("附加会话事件 payload 必须是对象")
         if event_type == "stimulation_config" and block_id is not None:
             raise ValueError("stimulation_config 不应关联 EEG block")
-        if event_type not in {"stimulation_config", "rally_control"} and block_id is None:
+        if event_type not in {"stimulation_config", "rally_control", "paradigm_control"} and block_id is None:
             raise ValueError(f"{event_type} 必须关联 EEG block")
         try:
             json.dumps(payload, ensure_ascii=False, allow_nan=False)
@@ -428,12 +431,15 @@ class SessionReader:
                 )
             block_id = event.get("block_id")
             payload = event.get("payload")
-            if event_type == "rally_control":
+            if event_type in {"rally_control", "paradigm_control"}:
                 try:
-                    validate_rally_control_event(event)
+                    if event_type == "rally_control":
+                        validate_rally_control_event(event)
+                    else:
+                        validate_paradigm_control_event(event)
                 except ValueError as exc:
                     raise SessionFormatError(
-                        f"events.jsonl 第 {line_number} 行 Rally 控制事件无效：{exc}"
+                        f"events.jsonl 第 {line_number} 行控制事件无效：{exc}"
                     ) from exc
                 if event.get("session_id") != self.manifest.get("session_id"):
                     raise SessionFormatError(

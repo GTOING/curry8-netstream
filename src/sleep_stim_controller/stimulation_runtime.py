@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from PySide6.QtCore import QObject, Signal
@@ -15,8 +16,10 @@ from .rally import (
     REAL_RALLY_ENDPOINT,
     RALLY_START_COMMAND,
     RALLY_STOP_COMMAND,
+    RALLY_APPLY_COMMAND,
     RallyControlEndpoint,
     RallyControlOutcome,
+    RallyControlNotSentReason,
     RallyControlRequest,
     RallyControlTransportWorker,
     RallyRequestOutcome,
@@ -30,6 +33,7 @@ from .staging import (
     ProcessingStatus,
     utc_now_iso,
 )
+from .paradigm import ParadigmRuntimeManager, ParadigmSnapshot
 from .stimulation import (
     DecisionEvaluation,
     RequestStatus,
@@ -62,6 +66,7 @@ class StimulationRuntime(QObject):
         rally_control_endpoint: RallyControlEndpoint = REAL_RALLY_ENDPOINT,
         real_transport_factory: Callable[..., RallyControlTransportWorker]
         | None = None,
+        allow_synthetic_paradigm_for_tests: bool = False,
     ) -> None:
         super().__init__(parent)
         if not callable(monotonic_ns):
@@ -86,6 +91,20 @@ class StimulationRuntime(QObject):
         # shares the session/pipeline writer hooks, but never shares the P3
         # JSON protocol or its simulator endpoint.
         self._control_mode = "simulation"
+        self._real_profile = "binary"
+        self._paradigm_manager = ParadigmRuntimeManager()
+        self._allow_synthetic_paradigm_for_tests = bool(
+            allow_synthetic_paradigm_for_tests
+        )
+        self._paradigm_latest_desired: str | None = None
+        self._paradigm_confirmed_protocol: str | None = None
+        self._paradigm_expiry_monotonic_ns: int | None = None
+        self._paradigm_expiry_utc: str | None = None
+        self._paradigm_expired = False
+        self._paradigm_start_confirmed_monotonic_ns: int | None = None
+        self._paradigm_previous_confirmed_monotonic_ns: int | None = None
+        self._paradigm_switch_started_monotonic_ns: int | None = None
+        self._real_confirmed_monotonic_ns: int | None = None
         self._real_auto_enabled = False
         self._real_runtime_state = "DISARMED/UNKNOWN"
         self._real_desired_state: str | None = None
@@ -102,13 +121,21 @@ class StimulationRuntime(QObject):
         self._real_seen_block_id = 0
         self._real_last_valid_block_id = 0
         self._real_latest_valid: tuple[ProcessingResult, BlockContext] | None = None
-        self._real_baseline_ready = False
+        self._real_armed_since_monotonic_ns: int | None = None
+        self._real_operator_confirmed = False
+        # A Start creates a physical-stop responsibility only at the worker's
+        # send boundary.  Keep the two sets separate so a sendto failure or a
+        # pre-send cancellation never creates a compensating Stop, while a
+        # cancel racing with sendto cannot erase an already-started command.
+        self._real_start_send_attempts: set[str] = set()
+        self._real_start_responsibilities: dict[str, tuple[str, int]] = {}
         self._real_stop_after_current = False
         self._real_close_requested = False
         self._real_shutdown_requested = False
         self._real_transport_stopped = False
         self._real_inflight: RallyControlRequest | None = None
         self._real_leases: dict[str, object] = {}
+        self._real_superseded_unsent: set[str] = set()
         self._real_control_history: list[dict[str, object]] = []
         self._real_endpoint = rally_control_endpoint
         self._transport = RallyTransportWorker(
@@ -124,6 +151,7 @@ class StimulationRuntime(QObject):
         control_factory = real_transport_factory or RallyControlTransportWorker
         self._real_transport = control_factory(
             before_send=self._before_real_send,
+            on_send_started=self._on_real_send_started,
             on_sent=self._on_real_sent,
             on_not_sent=self._on_real_not_sent,
             on_outcome=self._on_real_outcome,
@@ -151,6 +179,45 @@ class StimulationRuntime(QObject):
     def control_mode(self) -> str:
         with self._lock:
             return self._control_mode
+
+    @property
+    def real_profile(self) -> str:
+        with self._lock:
+            return self._real_profile
+
+    @property
+    def selected_paradigm(self) -> ParadigmSnapshot | None:
+        return self._paradigm_manager.selected
+
+    def select_paradigm(self, snapshot: ParadigmSnapshot) -> None:
+        with self._lock:
+            if self._session_id is not None:
+                raise RuntimeError("范式包必须在实时会话开始前选择")
+            if self._real_auto_enabled or self._real_inflight is not None:
+                raise RuntimeError("真实 Rally 控制收尾期间不能更换范式包")
+            self._paradigm_manager.select(snapshot)
+        self._emit_real_status()
+
+    def set_real_profile(self, profile: str) -> bool:
+        normalized = str(profile).strip().lower()
+        if normalized not in {"binary", "paradigm"}:
+            raise ValueError("Rally 协议模式必须是 binary 或 paradigm")
+        with self._lock:
+            if normalized == self._real_profile:
+                return True
+            if self._real_auto_enabled or self._real_inflight is not None:
+                return False
+            if self._real_start_responsibilities or self._real_independent_stop_required:
+                return False
+            self._real_profile = normalized
+            self._paradigm_latest_desired = None
+            self._paradigm_confirmed_protocol = None
+            self._paradigm_expiry_monotonic_ns = None
+            self._paradigm_expiry_utc = None
+            self._paradigm_expired = False
+            self._real_runtime_state = "DISARMED/UNKNOWN"
+        self._emit_real_status()
+        return True
 
     @property
     def real_control_enabled(self) -> bool:
@@ -333,6 +400,17 @@ class StimulationRuntime(QObject):
     def _real_config_issues_locked(self) -> tuple[str, ...]:
         config = self._config
         problems: list[str] = []
+        if self._real_profile == "paradigm":
+            age = config.max_result_age_seconds
+            if (
+                age is None
+                or isinstance(age, bool)
+                or not isinstance(age, (int, float))
+                or not math.isfinite(float(age))
+                or float(age) <= 0
+            ):
+                problems.append("最大结果年龄须为有限数值且 >0 秒")
+            return tuple(problems)
         targets = config.target_stages
         if not isinstance(targets, (set, frozenset)) or not targets:
             problems.append("尚未选择真实 Rally 目标睡眠期")
@@ -373,9 +451,29 @@ class StimulationRuntime(QObject):
         )
 
     def _real_status_locked(self) -> dict[str, object]:
+        snapshot = self._paradigm_manager.session_snapshot or self._paradigm_manager.selected
         return {
             "mode": self._control_mode,
+            "profile": self._real_profile,
+            "paradigm_name": snapshot.name if snapshot is not None else None,
+            "paradigm_version": snapshot.version if snapshot is not None else None,
+            "paradigm_sha256": snapshot.sha256 if snapshot is not None else None,
+            "paradigm_classification": snapshot.classification if snapshot is not None else None,
+            "latest_desired_protocol": self._paradigm_latest_desired,
+            "api_confirmed_protocol": self._paradigm_confirmed_protocol,
+            "estimated_expiry_monotonic_ns": self._paradigm_expiry_monotonic_ns,
+            "estimated_expiry_utc": self._paradigm_expiry_utc,
+            "expiry_is_estimate": self._paradigm_expiry_monotonic_ns is not None,
+            "physical_output_confirmed": False,
             "enabled": self._real_auto_enabled,
+            "armed": self._real_auto_enabled,
+            "operator_confirmed": self._real_operator_confirmed,
+            "arming_state": (
+                "ARMED/IDLE"
+                if self._real_auto_enabled
+                and self._real_runtime_state in {"ARMED/IDLE", "STOPPED"}
+                else self._real_runtime_state
+            ),
             "expected_state": self._real_expected_state,
             "desired_state": self._real_desired_state,
             "confirmed_state": self._real_confirmed_state,
@@ -388,8 +486,9 @@ class StimulationRuntime(QObject):
             if self._real_last_outcome is not None
             else None,
             "independent_stop_required": self._real_independent_stop_required,
+            "start_sent_responsibility": bool(self._real_start_responsibilities),
+            "start_send_in_flight": bool(self._real_start_send_attempts),
             "endpoint": f"{self._real_endpoint.host}:{self._real_endpoint.port}",
-            "baseline_ready": self._real_baseline_ready,
             "handshake_ready": self._real_handshake_ready,
             "model_configured": self._real_model_configured,
         }
@@ -414,38 +513,72 @@ class StimulationRuntime(QObject):
             if not self._real_model_configured:
                 problems.append("真实 Rally 控制必须显式选择 ONNX 模型")
             problems.extend(self._real_config_issues_locked())
+            paradigm = self._paradigm_manager.session_snapshot
+            if self._real_profile == "paradigm":
+                if paradigm is None:
+                    problems.append("范式模式必须在实时会话前选择并验证 A/B/C 范式包")
+                elif (
+                    not paradigm.real_armable
+                    and not (
+                        self._allow_synthetic_paradigm_for_tests
+                        and paradigm.classification == "synthetic/test-only"
+                    )
+                ):
+                    problems.append(
+                        "所选包不是经批准的生产范式，或其 SD 单位换算未验证；真实自动控制禁止启用"
+                    )
             if self._real_auto_enabled:
                 return True
+            if self._real_inflight is not None:
+                problems.append("已有真实 Rally 请求在途，不能重新 armed")
+            if (
+                self._real_confirmed_state == "RUNNING"
+                or self._real_start_responsibilities
+                or self._real_independent_stop_required
+            ):
+                problems.append(
+                    "上一条 Start/Stop 尚未完成安全收尾；请先在 Rally/硬件侧人工核对"
+                )
             pipeline = self._pipeline
             if problems:
                 detail = "真实 Rally 自动控制未启用：" + "；".join(problems)
             else:
                 self._real_auto_enabled = True
-                self._real_runtime_state = "STOPPING"
+                self._real_operator_confirmed = True
+                self._real_armed_since_monotonic_ns = self._monotonic_ns()
+                self._real_runtime_state = "ARMED/IDLE"
                 self._real_expected_state = "STOPPED"
                 self._real_desired_state = "STOPPED"
-                self._real_confirmed_state = None
-                self._real_confirmed_utc = None
-                self._real_baseline_ready = False
+                # Enabling is an operator declaration, not an API reply.  Do
+                # not manufacture a STOPPED confirmation or confirmation time.
+                # Only results received after this point may populate the
+                # real-control cache.
+                self._real_last_valid_block_id = 0
+                self._real_latest_valid = None
                 self._real_stop_after_current = False
-                self._real_independent_stop_required = False
                 self._real_close_requested = False
-                request = self._new_real_request_locked(
-                    RALLY_STOP_COMMAND,
-                    "显式启用真实控制；先建立 Stop Stim 安全基线",
-                    block_id=None,
-                    stage=None,
-                    model=None,
+                self._paradigm_latest_desired = None
+                self._paradigm_confirmed_protocol = None
+                self._paradigm_expiry_monotonic_ns = None
+                self._paradigm_expiry_utc = None
+                self._paradigm_expired = False
+                self._paradigm_start_confirmed_monotonic_ns = None
+                self._paradigm_previous_confirmed_monotonic_ns = None
+                self._paradigm_switch_started_monotonic_ns = None
+                self._real_confirmed_monotonic_ns = None
+                request = None
+                detail = (
+                    "真实 Rally 自动控制已 armed；操作者已确认协议已加载、已检查且当前未进行刺激；"
+                    "不会发送启用基线，等待启用后的新合格 ONNX 结果"
                 )
-                self._real_inflight = request
-                detail = "真实 Rally 自动控制已启用；正在发送 Stop Stim 基线，等待精确确认"
         if problems:
             self.automatic_status_changed.emit(False, detail)
             self._emit_real_status()
             return False
         self.automatic_status_changed.emit(True, detail)
         self._remember_control_event(self._build_real_config_event())
-        self._submit_real_request(request, pipeline)
+        if request is not None:
+            self._submit_real_request(request, pipeline)
         self._emit_real_status()
         return True
 
@@ -457,26 +590,36 @@ class StimulationRuntime(QObject):
     ) -> None:
         with self._lock:
             self._real_auto_enabled = False
+            self._real_operator_confirmed = False
             self._real_close_requested = self._real_close_requested or close_after
             self._real_expected_state = "STOPPED"
             self._real_desired_state = "STOPPED"
+            self._paradigm_latest_desired = None
             current = self._real_inflight
             pipeline = self._pipeline
             confirmed = self._real_confirmed_state
             if current is not None and current.command == RALLY_START_COMMAND:
+                sent_or_started = (
+                    current.request_id in self._real_start_responsibilities
+                    or current.request_id in self._real_start_send_attempts
+                )
+                self._real_stop_after_current = sent_or_started
+                if not sent_or_started:
+                    self._real_runtime_state = "DISARMED/UNKNOWN"
+                self._real_transport.cancel_unsent()
+                request = None
+            elif current is not None and current.command == RALLY_APPLY_COMMAND:
                 self._real_stop_after_current = True
                 self._real_transport.cancel_unsent()
                 request = None
             elif current is not None:
                 request = None
-            elif confirmed == "STOPPED":
+            elif confirmed == "STOPPED" and not self._real_start_responsibilities:
                 self._real_runtime_state = "STOPPED"
                 request = None
             elif self._real_runtime_state == "FAULT/UNKNOWN":
                 request = None
-            elif self._real_session_id is None and self._session_id is None:
-                request = None
-            else:
+            elif confirmed == "RUNNING" or self._real_start_responsibilities:
                 self._real_runtime_state = "STOPPING"
                 request = self._new_real_request_locked(
                     RALLY_STOP_COMMAND,
@@ -486,6 +629,13 @@ class StimulationRuntime(QObject):
                     model=None,
                 )
                 self._real_inflight = request
+            elif self._real_session_id is None and self._session_id is None:
+                request = None
+            else:
+                # No API RUNNING confirmation and no Start send evidence:
+                # disabling an armed/idle controller must be a zero-UDP path.
+                self._real_runtime_state = "DISARMED/UNKNOWN"
+                request = None
         self.automatic_status_changed.emit(False, reason)
         if request is not None:
             self._submit_real_request(request, pipeline, required_stop=True)
@@ -500,6 +650,7 @@ class StimulationRuntime(QObject):
         block_id: int | None,
         stage: str | None,
         model: dict[str, object] | None,
+        protocol_key: str | None = None,
     ) -> RallyControlRequest:
         session_id = self._real_session_id or self._session_id
         if session_id is None:
@@ -509,6 +660,12 @@ class StimulationRuntime(QObject):
             for stage_name in STAGES
             if stage_name in self._config.target_stages
         )
+        protocol = None
+        if protocol_key is not None:
+            snapshot = self._paradigm_manager.session_snapshot
+            if snapshot is None:
+                raise RuntimeError("没有冻结的范式快照")
+            protocol = snapshot.protocol_map[protocol_key]
         return RallyControlRequest(
             request_id=uuid.uuid4().hex,
             session_id=session_id,
@@ -520,12 +677,16 @@ class StimulationRuntime(QObject):
             model=dict(model) if isinstance(model, dict) else None,
             target_stages=targets,
             desired_state="RUNNING"
-            if command == RALLY_START_COMMAND
+            if command in {RALLY_START_COMMAND, RALLY_APPLY_COMMAND}
             else "STOPPED",
             confirmed_state=self._real_confirmed_state,
             runtime_state=self._real_runtime_state,
             created_utc=utc_now_iso(),
             created_monotonic_ns=self._monotonic_ns(),
+            protocol_name=protocol.key if protocol is not None else None,
+            protocol_payload_json=protocol.payload_json if protocol is not None else None,
+            protocol_sha256=protocol.sha256 if protocol is not None else None,
+            protocol_payload_sha256=protocol.payload_sha256 if protocol is not None else None,
         )
 
     def _submit_real_request(
@@ -562,7 +723,10 @@ class StimulationRuntime(QObject):
                             self._real_inflight = None
                     self._on_real_not_sent(
                         request,
-                        "会话已开始收尾，Rally 请求未发送",
+                        RallyControlNotSentReason(
+                            "pipeline_lease_rejected",
+                            "会话已开始收尾，Rally 请求未发送",
+                        ),
                         RequestStatus.NOT_SENT,
                         pipeline_override=pipeline,
                     )
@@ -575,7 +739,10 @@ class StimulationRuntime(QObject):
         if not submitted:
             self._on_real_not_sent(
                 request,
-                "真实 Rally 传输忙碌、正在退出或隔离资源已达上限；请求未发送",
+                RallyControlNotSentReason(
+                    "worker_rejected",
+                    "真实 Rally 传输忙碌、正在退出或隔离资源已达上限；请求未发送",
+                ),
                 RequestStatus.NOT_SENT,
                 pipeline_override=(pipeline if held_lease is None else None),
             )
@@ -621,6 +788,25 @@ class StimulationRuntime(QObject):
             return f"当前模型结果不可用：{result.reason or result.status.value}"
         if not self._real_model_is_onnx(result):
             return "当前分期结果不是已确认的 ONNX 模型结果"
+        if self._real_profile == "paradigm":
+            snapshot = self._paradigm_manager.session_snapshot
+            if snapshot is None:
+                return "范式模式没有冻结的范式快照"
+            channel_selection = (
+                result.model.configuration.get("channel_selection")
+                if isinstance(result.model.configuration, dict)
+                else None
+            )
+            resolved = (
+                channel_selection.get("resolved_label")
+                if isinstance(channel_selection, dict)
+                else None
+            )
+            if len(snapshot.model_input_channels) != 1 or (
+                isinstance(resolved, str)
+                and resolved.casefold() != snapshot.model_input_channels[0].casefold()
+            ):
+                return "范式包模型输入通道与当前 ONNX 通道配置不一致"
         if result.stage not in STAGES:
             return "当前 ONNX 结果缺少合法睡眠期"
         if context.session_id != self._real_session_id or result.session_id != self._real_session_id:
@@ -656,10 +842,13 @@ class StimulationRuntime(QObject):
 
     def _real_cached_result_is_eligible_locked(self, *, now_ns: int) -> bool:
         latest = self._real_latest_valid_result_locked()
-        if latest is None or not self._real_baseline_ready:
+        if latest is None or not self._real_auto_enabled:
             return False
         result, context = latest
         if result.block_id != self._real_last_valid_block_id:
+            return False
+        armed_since = self._real_armed_since_monotonic_ns
+        if armed_since is None or result.finished_monotonic_ns <= armed_since:
             return False
         return not self._real_result_eligibility_reason_locked(
             context, result, now_ns=now_ns
@@ -676,46 +865,210 @@ class StimulationRuntime(QObject):
         now_ns = self._monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
         with self._lock:
             if (
+                self._control_mode == "real"
+                and self._real_profile == "paradigm"
+                and self._real_auto_enabled
+                and self._paradigm_confirmed_protocol is not None
+                and self._paradigm_expiry_monotonic_ns is not None
+                and now_ns >= self._paradigm_expiry_monotonic_ns
+            ):
+                expire = True
+            else:
+                expire = False
+            if expire:
+                pass
+            elif (
                 not self._real_auto_enabled
                 or self._control_mode != "real"
                 or self._real_latest_valid is None
             ):
                 return False
-            if self._real_cached_result_is_eligible_locked(now_ns=now_ns):
+            elif self._real_cached_result_is_eligible_locked(now_ns=now_ns):
                 return False
+        if expire:
+            self._expire_paradigm("已达到包内 SD 换算所得估计到期时间")
+            return True
         self._handle_real_fault("自最近合格 ONNX 结果后没有新数据，结果年龄已超过配置阈值")
         return True
 
+    def _expire_paradigm(
+        self,
+        reason: str,
+        *,
+        lease=None,
+        pipeline_override=None,
+    ) -> None:
+        with self._lock:
+            first_expiry = not self._paradigm_expired
+            if first_expiry:
+                self._paradigm_expired = True
+                self._real_auto_enabled = False
+                self._real_operator_confirmed = False
+                self._real_expected_state = "STOPPED"
+                self._real_desired_state = "STOPPED"
+                self._paradigm_latest_desired = None
+                self._real_runtime_state = "EXPIRED/UNKNOWN"
+            current = self._real_inflight
+            pipeline = (
+                pipeline_override
+                if pipeline_override is not None
+                else self._pipeline
+            )
+            if current is None:
+                self._real_stop_after_current = False
+            if current is not None and current.command != RALLY_STOP_COMMAND:
+                self._real_stop_after_current = True
+                self._real_transport.cancel_unsent()
+                request = None
+            elif current is not None:
+                request = None
+            elif self._real_start_responsibilities:
+                request = self._new_real_request_locked(
+                    RALLY_STOP_COMMAND,
+                    f"估计协议到期；保护性 Stop（{reason}）",
+                    block_id=None,
+                    stage=None,
+                    model=None,
+                )
+                self._real_inflight = request
+                self._real_runtime_state = "STOPPING"
+                self._real_stop_after_current = False
+            else:
+                request = None
+            expired_event = None
+            if first_expiry:
+                expired_event = {
+                    "event_type": "paradigm_control",
+                    "session_id": self._real_session_id or self._session_id,
+                    "block_id": None,
+                    "payload": {
+                        "schema_version": 1,
+                        "phase": "decision",
+                        "mode": "real",
+                        "profile": "paradigm",
+                        "reason": reason,
+                        "action": "expired",
+                        "desired_protocol": None,
+                        "api_confirmed_protocol": self._paradigm_confirmed_protocol,
+                        "desired_state": "STOPPED",
+                        "confirmed_state": self._real_confirmed_state,
+                        "runtime_state": "EXPIRED/UNKNOWN",
+                        "estimated_expiry_monotonic_ns": self._paradigm_expiry_monotonic_ns,
+                        "expiry_is_estimate": True,
+                        "physical_output_confirmed": False,
+                        "created_utc": utc_now_iso(),
+                        "created_monotonic_ns": self._monotonic_ns(),
+                        "outcome": "unknown",
+                    },
+                }
+        if expired_event is not None:
+            self._remember_control_event(expired_event)
+            self.automatic_status_changed.emit(
+                False,
+                f"范式协议估计到期：{reason}；该时间不是物理停止证据，须人工核对后重新启用",
+            )
+        if request is not None:
+            self._submit_real_request(
+                request, pipeline, lease=lease, required_stop=True
+            )
+        elif lease is not None:
+            self._release_real_lease(lease)
+        self._emit_real_status()
+
     def _before_real_send(
         self, request: RallyControlRequest, _worker_now_ns: int
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str] | tuple[bool, str, str]:
         """Final worker-thread admission check immediately before ``sendto``."""
-        if request.command != RALLY_START_COMMAND:
+        if request.command == RALLY_STOP_COMMAND:
+            return True, ""
+        if request.command == RALLY_APPLY_COMMAND:
+            with self._lock:
+                if (
+                    self._real_profile != "paradigm"
+                    or not self._real_auto_enabled
+                    or self._control_mode != "real"
+                    or self._real_close_requested
+                    or self._real_shutdown_requested
+                    or self._real_inflight is not request
+                    or request.session_id != self._real_session_id
+                    or request.generation != self._real_generation
+                ):
+                    return (
+                        False,
+                        "发送前复核：范式 Apply 已失去当前会话资格",
+                        "lifecycle_rejected",
+                    )
+                now_ns = self._monotonic_ns()
+                expiry = self._paradigm_expiry_monotonic_ns
+                if self._paradigm_expired or (
+                    expiry is not None and now_ns >= expiry
+                ):
+                    return (
+                        False,
+                        "发送前复核：已达到协议估计到期时间",
+                        "expired",
+                    )
+                if self._real_stop_after_current:
+                    return (
+                        False,
+                        "发送前复核：Stop 优先，范式 Apply 未发送",
+                        "stop_priority",
+                    )
+                if self._paradigm_latest_desired != request.protocol_name:
+                    if (
+                        self._paradigm_latest_desired is not None
+                        and self._real_cached_result_is_eligible_locked(
+                            now_ns=now_ns
+                        )
+                    ):
+                        return (
+                            False,
+                            "发送前复核：新合格期别已替代当前 Apply",
+                            "superseded",
+                        )
+                    return (
+                        False,
+                        "发送前复核：范式期望已变化且最新结果不再合格",
+                        "lifecycle_rejected",
+                    )
+                if not self._real_cached_result_is_eligible_locked(now_ns=now_ns):
+                    return (
+                        False,
+                        "发送前复核：范式 Apply 对应的最新 ONNX 结果已过期",
+                        "stale_result",
+                    )
             return True, ""
         with self._lock:
             if (
                 not self._real_auto_enabled
                 or self._control_mode != "real"
-                or not self._real_baseline_ready
                 or self._real_close_requested
                 or self._real_shutdown_requested
                 or self._real_inflight is not request
                 or request.session_id != self._real_session_id
                 or request.generation != self._real_generation
             ):
-                return False, "发送前复核：真实 Rally Start 已失去当前会话资格"
+                return (
+                    False,
+                    "发送前复核：真实 Rally Start 已失去当前会话资格",
+                    "lifecycle_rejected",
+                )
             latest = self._real_latest_valid_result_locked()
             if latest is None:
-                return False, "发送前复核：没有可用的当前 ONNX 结果"
+                return False, "发送前复核：没有可用的当前 ONNX 结果", "stale_result"
             result, _context = latest
-            if result.block_id != request.block_id:
-                return False, "发送前复核：Start 对应的 ONNX 结果已被更新"
+            if self._real_profile == "paradigm":
+                if self._paradigm_latest_desired is None or self._real_stop_after_current:
+                    return False, "发送前复核：范式 Stop 优先，Start 未发送", "stop_priority"
+            elif result.block_id != request.block_id:
+                return False, "发送前复核：Start 对应的 ONNX 结果已被更新", "stale_result"
             if self._real_stop_after_current or self._real_desired_state != "RUNNING":
-                return False, "发送前复核：Stop 优先，Start 未发送"
+                return False, "发送前复核：Stop 优先，Start 未发送", "stop_priority"
+            now_ns = self._monotonic_ns()
             if not self._real_cached_result_is_eligible_locked(
-                now_ns=self._monotonic_ns()
+                now_ns=now_ns
             ):
-                return False, "发送前复核：当前 ONNX 结果已过期"
+                return False, "发送前复核：当前 ONNX 结果已过期", "stale_result"
         return True, ""
 
     def _process_real_result(
@@ -727,8 +1080,7 @@ class StimulationRuntime(QObject):
     ) -> tuple[dict[str, object], ...]:
         with self._lock:
             if (
-                not self._real_auto_enabled
-                or self._control_mode != "real"
+                self._control_mode != "real"
                 or context.session_id != self._real_session_id
                 or result.session_id != self._real_session_id
                 or (
@@ -737,19 +1089,48 @@ class StimulationRuntime(QObject):
                 )
             ):
                 return ()
+            if (
+                isinstance(result.block_id, bool)
+                or not isinstance(result.block_id, int)
+                or result.block_id <= 0
+            ):
+                return ()
             if result.block_id <= self._real_seen_block_id:
                 return ()
-            gap = (
-                self._real_seen_block_id > 0
-                and result.block_id != self._real_seen_block_id + 1
-            )
+            previous_seen_block_id = self._real_seen_block_id
             self._real_seen_block_id = result.block_id
-            if gap:
-                reason = f"当前实时块序出现缺口：上一块 {result.block_id - 2} 后收到 {result.block_id}"
+            # Keep a session-wide high-water mark even while control is
+            # disarmed. Blocks completed during that interval must not look
+            # like a gap when the operator arms again.
+            if not self._real_auto_enabled:
+                return ()
+            armed_since = self._real_armed_since_monotonic_ns
+            finished_ns = result.finished_monotonic_ns
+            if armed_since is None:
+                reason = "当前真实控制缺少有效的启用时间边界"
+            elif (
+                isinstance(finished_ns, int)
+                and not isinstance(finished_ns, bool)
+                and finished_ns <= armed_since
+            ):
+                # This result may have been completed before arming and only
+                # delivered afterward. It advances the observed block mark,
+                # but is not an armed decision and must not create a fault.
+                return ()
             else:
-                reason = self._real_result_eligibility_reason_locked(
-                    context, result, now_ns=self._monotonic_ns()
+                gap = (
+                    previous_seen_block_id > 0
+                    and result.block_id != previous_seen_block_id + 1
                 )
+                if gap:
+                    reason = (
+                        f"当前实时块序出现缺口：上一块 {previous_seen_block_id} 后收到 "
+                        f"{result.block_id}"
+                    )
+                else:
+                    reason = self._real_result_eligibility_reason_locked(
+                        context, result, now_ns=self._monotonic_ns()
+                    )
             if reason:
                 # An active real session's model/gap/age fault is not a
                 # sleep-stage decision. It invokes one bounded stop path.
@@ -763,34 +1144,78 @@ class StimulationRuntime(QObject):
                 self._real_last_valid_block_id = result.block_id
                 self._real_latest_valid = (result, context)
                 model = result.model.to_dict()
-                desired = "RUNNING" if stage in self._config.target_stages else "STOPPED"
-                self._real_desired_state = desired
-                request = self._plan_real_request_locked(
-                    desired,
-                    reason=(
-                        "当前目标睡眠期，申请 Start Stim"
-                        if desired == "RUNNING"
-                        else "当前非目标睡眠期，申请 Stop Stim"
-                    ),
-                    block_id=result.block_id,
-                    stage=stage,
-                    model=model,
-                )
-                decision_event = self._build_real_decision_event_locked(
-                    result,
-                    request,
-                    reason=(
-                        request.reason
-                        if request is not None
-                        else (
-                            "目标状态与最近确认一致，控制 no-op"
-                            if desired == self._real_confirmed_state
-                            else "已有 Rally 请求在途，保留最新期望状态"
+                if self._real_profile == "paradigm":
+                    snapshot = self._paradigm_manager.session_snapshot
+                    if snapshot is None:
+                        reason = "范式模式没有冻结的范式快照"
+                        request = None
+                        decision_event = None
+                    else:
+                        desired_protocol = snapshot.protocol_for_stage(stage)
+                        desired_key = desired_protocol.key if desired_protocol else None
+                        self._paradigm_latest_desired = desired_key
+                        self._real_desired_state = (
+                            "RUNNING" if desired_key is not None else "STOPPED"
                         )
-                    ),
-                )
+                        request = self._plan_paradigm_request_locked(
+                            desired_key,
+                            reason=(
+                                f"stage={stage} 映射到协议 {desired_key}"
+                                if desired_key is not None
+                                else f"stage={stage} 映射为 Stop"
+                            ),
+                            block_id=result.block_id,
+                            stage=stage,
+                            model=model,
+                        )
+                        decision_event = self._build_paradigm_decision_event_locked(
+                            context,
+                            result,
+                            request,
+                            desired_key,
+                            reason=(
+                                request.reason
+                                if request is not None
+                                else (
+                                    "API 已确认当前协议；当前结果 no-op"
+                                    if desired_key == self._paradigm_confirmed_protocol
+                                    else "已有请求在途；仅保留最新期望"
+                                    if self._real_inflight is not None
+                                    else "当前结果映射为无刺激；没有未解决 Start 责任"
+                                )
+                            ),
+                        )
+                else:
+                    desired = "RUNNING" if stage in self._config.target_stages else "STOPPED"
+                    self._real_desired_state = desired
+                    request = self._plan_real_request_locked(
+                        desired,
+                        reason=(
+                            "当前目标睡眠期，申请 Start Stim"
+                            if desired == "RUNNING"
+                            else "当前非目标睡眠期，申请 Stop Stim"
+                        ),
+                        block_id=result.block_id,
+                        stage=stage,
+                        model=model,
+                    )
+                    decision_event = self._build_real_decision_event_locked(
+                        result,
+                        request,
+                        reason=(
+                            request.reason
+                            if request is not None
+                            else (
+                                "目标状态与最近确认一致，控制 no-op"
+                                if desired == self._real_confirmed_state
+                                else "已有 Rally 请求在途，保留最新期望状态"
+                            )
+                        ),
+                    )
                 submit_pipeline = self._pipeline
                 recording_enabled = self._recording_enabled
+            if not reason and decision_event is None:
+                reason = "范式模式没有冻结的范式快照"
         if reason:
             self._handle_real_fault(reason)
             return ()
@@ -808,6 +1233,164 @@ class StimulationRuntime(QObject):
             else (decision_event,)
         )
 
+    def _plan_paradigm_request_locked(
+        self,
+        desired_protocol: str | None,
+        *,
+        reason: str,
+        block_id: int | None,
+        stage: str | None,
+        model: dict[str, object] | None,
+    ) -> RallyControlRequest | None:
+        current = self._real_inflight
+        self._real_expected_state = "RUNNING" if desired_protocol is not None else "STOPPED"
+        self._real_desired_state = self._real_expected_state
+        if current is not None:
+            if desired_protocol is None and current.command != RALLY_STOP_COMMAND:
+                self._real_stop_after_current = True
+                self._real_transport.cancel_unsent()
+            elif (
+                current.command == RALLY_APPLY_COMMAND
+                and desired_protocol is not None
+                and desired_protocol != current.protocol_name
+            ):
+                self._real_superseded_unsent.add(current.request_id)
+                self._real_transport.cancel_unsent()
+            return None
+        if self._paradigm_expired:
+            return None
+        if desired_protocol is None:
+            if (
+                self._real_confirmed_state == "RUNNING"
+                or self._real_start_responsibilities
+                or self._real_start_send_attempts
+            ):
+                command = RALLY_STOP_COMMAND
+                runtime_state = "STOPPING"
+            else:
+                self._real_runtime_state = (
+                    "ARMED/IDLE"
+                    if self._real_auto_enabled
+                    else (
+                        "STOPPED"
+                        if self._real_confirmed_state == "STOPPED"
+                        else "DISARMED/UNKNOWN"
+                    )
+                )
+                return None
+            request = self._new_real_request_locked(
+                command,
+                reason,
+                block_id=block_id,
+                stage=stage,
+                model=model,
+            )
+            self._real_inflight = request
+            self._real_runtime_state = runtime_state
+            return request
+
+        if self._paradigm_confirmed_protocol == desired_protocol and self._real_confirmed_state == "RUNNING":
+            self._real_runtime_state = "RUNNING"
+            return None
+        if self._real_confirmed_state == "RUNNING" or self._real_start_responsibilities:
+            command = RALLY_APPLY_COMMAND
+            runtime_state = (
+                f"SWITCHING({self._paradigm_confirmed_protocol},{desired_protocol})"
+                if self._paradigm_confirmed_protocol is not None
+                else f"APPLYING({desired_protocol})"
+            )
+            protocol_key = desired_protocol
+        else:
+            command = RALLY_START_COMMAND
+            runtime_state = "STARTING"
+            protocol_key = None
+        request = self._new_real_request_locked(
+            command,
+            reason,
+            block_id=block_id,
+            stage=stage,
+            model=model,
+            protocol_key=protocol_key,
+        )
+        self._real_inflight = request
+        self._real_runtime_state = runtime_state
+        return request
+
+    def _build_paradigm_decision_event_locked(
+        self,
+        context: BlockContext,
+        result: ProcessingResult,
+        request: RallyControlRequest | None,
+        desired_protocol: str | None,
+        *,
+        reason: str,
+    ) -> dict[str, object]:
+        snapshot = self._paradigm_manager.session_snapshot
+        assert snapshot is not None
+        duration = max(
+            0.0,
+            (result.end_sample_exclusive - result.start_sample)
+            / float(context.block.sample_rate_hz),
+        )
+        try:
+            epoch_end = datetime.fromisoformat(context.received_utc.replace("Z", "+00:00"))
+            if epoch_end.tzinfo is None:
+                epoch_end = epoch_end.replace(tzinfo=timezone.utc)
+            epoch_start = epoch_end - timedelta(seconds=duration)
+            epoch_start_utc = epoch_start.isoformat().replace("+00:00", "Z")
+            epoch_end_utc = epoch_end.isoformat().replace("+00:00", "Z")
+        except (TypeError, ValueError, OverflowError):
+            epoch_start_utc = None
+            epoch_end_utc = context.received_utc
+        action = (
+            "apply" if request and request.command == RALLY_APPLY_COMMAND
+            else "start" if request and request.command == RALLY_START_COMMAND
+            else "stop" if request and request.command == RALLY_STOP_COMMAND
+            else "no_op"
+        )
+        return {
+            "event_type": "paradigm_control",
+            "session_id": result.session_id,
+            "block_id": result.block_id,
+            "request_id": request.request_id if request is not None else None,
+            "payload": {
+                "schema_version": 1,
+                "phase": "decision",
+                "mode": "real",
+                "profile": "paradigm",
+                "reason": reason,
+                "action": action,
+                "stage": result.stage,
+                "confidence": result.confidence,
+                "model": result.model.to_dict(),
+                "model_input_channels": list(snapshot.model_input_channels),
+                "epoch": {
+                    "start_sample": result.start_sample,
+                    "end_sample_exclusive": result.end_sample_exclusive,
+                    "start_utc": epoch_start_utc,
+                    "end_utc": epoch_end_utc,
+                    "received_utc": context.received_utc,
+                    "received_monotonic_ns": context.received_monotonic_ns,
+                    "result_started_monotonic_ns": result.started_monotonic_ns,
+                    "result_finished_monotonic_ns": result.finished_monotonic_ns,
+                    "decision_created_utc": utc_now_iso(),
+                },
+                "paradigm_name": snapshot.name,
+                "paradigm_version": snapshot.version,
+                "paradigm_sha256": snapshot.sha256,
+                "required_rally_base_protocol": snapshot.required_rally_base_protocol,
+                "desired_protocol": desired_protocol,
+                "api_confirmed_protocol": self._paradigm_confirmed_protocol,
+                "desired_state": self._real_desired_state,
+                "confirmed_state": self._real_confirmed_state,
+                "runtime_state": self._real_runtime_state,
+                "physical_output_confirmed": False,
+                "created_utc": utc_now_iso(),
+                "created_monotonic_ns": self._monotonic_ns(),
+                "outcome": "planned" if request is not None else "no_op",
+            },
+        }
+
     def _plan_real_request_locked(
         self,
         desired: str,
@@ -823,8 +1406,24 @@ class StimulationRuntime(QObject):
                 self._real_stop_after_current = True
                 self._real_transport.cancel_unsent()
             return None
-        if desired == self._real_confirmed_state:
+        if desired == "RUNNING" and desired == self._real_confirmed_state:
             self._real_runtime_state = desired
+            return None
+        if desired == "STOPPED" and not (
+            self._real_confirmed_state == "RUNNING"
+            or self._real_start_responsibilities
+            or self._real_start_send_attempts
+        ):
+            self._real_expected_state = "STOPPED"
+            self._real_runtime_state = (
+                "ARMED/IDLE"
+                if self._real_auto_enabled
+                else (
+                    "STOPPED"
+                    if self._real_confirmed_state == "STOPPED"
+                    else "DISARMED/UNKNOWN"
+                )
+            )
             return None
         command = (
             RALLY_START_COMMAND if desired == "RUNNING" else RALLY_STOP_COMMAND
@@ -846,14 +1445,32 @@ class StimulationRuntime(QObject):
             current = self._real_inflight
             pipeline = self._pipeline
             if current is not None and current.command == RALLY_START_COMMAND:
+                sent_or_started = (
+                    current.request_id in self._real_start_responsibilities
+                    or current.request_id in self._real_start_send_attempts
+                )
+                self._real_stop_after_current = sent_or_started
+                self._real_transport.cancel_unsent()
+                if not sent_or_started:
+                    self._real_runtime_state = "FAULT/UNKNOWN"
+                request = None
+            elif current is not None and current.command == RALLY_APPLY_COMMAND:
                 self._real_stop_after_current = True
                 self._real_transport.cancel_unsent()
                 request = None
             elif current is not None:
                 request = None
-            elif self._real_confirmed_state == "STOPPED":
+            elif (
+                self._real_confirmed_state == "STOPPED"
+                and not self._real_start_responsibilities
+                and not self._real_start_send_attempts
+            ):
                 request = None
-            else:
+            elif (
+                self._real_confirmed_state == "RUNNING"
+                or self._real_start_responsibilities
+                or self._real_start_send_attempts
+            ):
                 request = self._new_real_request_locked(
                     RALLY_STOP_COMMAND,
                     f"保护性停止：{reason}",
@@ -863,9 +1480,14 @@ class StimulationRuntime(QObject):
                 )
                 self._real_inflight = request
                 self._real_runtime_state = "STOPPING"
+            else:
+                request = None
+                self._real_runtime_state = "FAULT/UNKNOWN"
             self._real_auto_enabled = False
+            self._real_operator_confirmed = False
             self._real_expected_state = "STOPPED"
             self._real_desired_state = "STOPPED"
+            self._paradigm_latest_desired = None
         self.automatic_status_changed.emit(False, f"真实控制故障：{reason}")
         if request is not None:
             self._submit_real_request(request, pipeline, required_stop=True)
@@ -873,6 +1495,38 @@ class StimulationRuntime(QObject):
 
     def _build_real_config_event(self) -> dict[str, object]:
         with self._lock:
+            if self._real_profile == "paradigm":
+                snapshot = self._paradigm_manager.session_snapshot
+                if snapshot is None:
+                    raise RuntimeError("范式模式无法记录：没有冻结的范式快照")
+                return {
+                    "event_type": "paradigm_control",
+                    "session_id": self._real_session_id or self._session_id,
+                    "block_id": None,
+                    "payload": {
+                        "schema_version": 1,
+                        "phase": "config",
+                        "mode": "real",
+                        "profile": "paradigm",
+                        "reason": (
+                            "操作者显式确认所选 Rally 基础协议及范式包；"
+                            "启用不发送命令；API 确认与物理输出确认分离"
+                        ),
+                        "operator_confirmed": self._real_operator_confirmed,
+                        "paradigm_snapshot": snapshot.to_snapshot(),
+                        "model_input_channels": list(snapshot.model_input_channels),
+                        "required_rally_base_protocol": snapshot.required_rally_base_protocol,
+                        "desired_protocol": self._paradigm_latest_desired,
+                        "api_confirmed_protocol": self._paradigm_confirmed_protocol,
+                        "desired_state": self._real_desired_state,
+                        "confirmed_state": self._real_confirmed_state,
+                        "runtime_state": self._real_runtime_state,
+                        "physical_output_confirmed": False,
+                        "created_utc": utc_now_iso(),
+                        "created_monotonic_ns": self._monotonic_ns(),
+                        "outcome": "configured",
+                    },
+                }
             return {
                 "event_type": "rally_control",
                 "session_id": self._real_session_id or self._session_id,
@@ -882,7 +1536,10 @@ class StimulationRuntime(QObject):
                     "phase": "config",
                     "mode": "real",
                     "command": None,
-                    "reason": "用户显式确认真实 Rally 模式；协议由操作者在 Rally 中加载",
+                    "reason": (
+                        "用户显式确认真实 Rally 模式；操作者确认协议已加载并检查，"
+                        "当前未进行刺激；启用不发送基线命令"
+                    ),
                     "stage": None,
                     "model": None,
                     "target_stages": [
@@ -938,8 +1595,17 @@ class StimulationRuntime(QObject):
         *,
         outcome: RallyControlOutcome | None = None,
         status: str | None = None,
+        sent_monotonic_ns: int | None = None,
     ) -> dict[str, object]:
         with self._lock:
+            if self._real_profile == "paradigm":
+                return self._build_paradigm_transport_event_locked(
+                    request,
+                    phase,
+                    outcome=outcome,
+                    status=status,
+                    sent_monotonic_ns=sent_monotonic_ns,
+                )
             confirmed = self._real_confirmed_state
             runtime = self._real_runtime_state
         response = None
@@ -987,6 +1653,109 @@ class StimulationRuntime(QObject):
             "payload": payload,
         }
 
+    def _build_paradigm_transport_event_locked(
+        self,
+        request: RallyControlRequest,
+        phase: str,
+        *,
+        outcome: RallyControlOutcome | None,
+        status: str | None,
+        sent_monotonic_ns: int | None,
+    ) -> dict[str, object]:
+        operation = (
+            "apply" if request.command == RALLY_APPLY_COMMAND
+            else "start" if request.command == RALLY_START_COMMAND
+            else "stop"
+        )
+        response = None
+        if outcome is not None:
+            response = {
+                "text": outcome.raw_text,
+                "bytes_b64": outcome.raw_bytes_b64(),
+                "source": (
+                    {
+                        "host": outcome.response_source_host,
+                        "port": outcome.response_source_port,
+                    }
+                    if outcome.response_source_host is not None
+                    else None
+                ),
+            }
+        protocol = request.protocol_name
+        received_ns = (
+            outcome.received_monotonic_ns
+            if outcome is not None and outcome.received_monotonic_ns is not None
+            else self._monotonic_ns()
+            if phase == "sent"
+            else None
+        )
+        activation_window_ns = None
+        switch_duration_ns = None
+        maintain_interval_ns = None
+        if operation == "apply" and outcome is not None and outcome.status is RequestStatus.API_SUCCESS:
+            if self._paradigm_start_confirmed_monotonic_ns is not None:
+                activation_window_ns = (
+                    outcome.received_monotonic_ns - self._paradigm_start_confirmed_monotonic_ns
+                    if outcome.received_monotonic_ns is not None
+                    else None
+                )
+            if self._paradigm_switch_started_monotonic_ns is not None and outcome.received_monotonic_ns is not None:
+                switch_duration_ns = outcome.received_monotonic_ns - self._paradigm_switch_started_monotonic_ns
+            if self._paradigm_previous_confirmed_monotonic_ns is not None and outcome.received_monotonic_ns is not None:
+                maintain_interval_ns = outcome.received_monotonic_ns - self._paradigm_previous_confirmed_monotonic_ns
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "phase": phase,
+            "mode": "real",
+            "profile": "paradigm",
+            "reason": request.reason,
+            "action": operation,
+            "operation": operation,
+            "stage": request.stage,
+            "model": request.model,
+            "model_input_channels": list(
+                (self._paradigm_manager.session_snapshot.model_input_channels)
+                if self._paradigm_manager.session_snapshot is not None
+                else ()
+            ),
+            "desired_protocol": self._paradigm_latest_desired,
+            "api_confirmed_protocol": self._paradigm_confirmed_protocol,
+            "protocol_name": protocol,
+            "protocol_payload_json": request.protocol_payload_json,
+            "protocol_sha256": request.protocol_sha256,
+            "protocol_payload_sha256": request.protocol_payload_sha256,
+            "required_rally_base_protocol": (
+                self._paradigm_manager.session_snapshot.required_rally_base_protocol
+                if self._paradigm_manager.session_snapshot is not None
+                else None
+            ),
+            "desired_state": request.desired_state,
+            "confirmed_state": self._real_confirmed_state,
+            "runtime_state": self._real_runtime_state,
+            "physical_output_confirmed": False,
+            "created_utc": request.created_utc,
+            "created_monotonic_ns": request.created_monotonic_ns,
+            "sent_utc": utc_now_iso() if phase == "sent" else None,
+            "sent_monotonic_ns": (
+                outcome.sent_monotonic_ns if outcome else sent_monotonic_ns
+            ),
+            "received_utc": utc_now_iso() if outcome else None,
+            "received_monotonic_ns": outcome.received_monotonic_ns if outcome else None,
+            "activation_start_to_apply_ns": activation_window_ns,
+            "switch_duration_ns": switch_duration_ns,
+            "maintain_interval_ns": maintain_interval_ns,
+            "estimated_expiry_monotonic_ns": self._paradigm_expiry_monotonic_ns,
+            "response": response,
+            "outcome": status or (outcome.status.value if outcome else "sent"),
+        }
+        return {
+            "event_type": "paradigm_control",
+            "session_id": request.session_id,
+            "block_id": request.block_id,
+            "request_id": request.request_id,
+            "payload": payload,
+        }
+
     def _remember_control_event(self, event: dict[str, object]) -> None:
         with self._lock:
             self._real_control_history.append(dict(event))
@@ -996,21 +1765,54 @@ class StimulationRuntime(QObject):
             if not pipeline.enqueue_session_event(event):
                 self.diagnostic.emit("Rally 控制事件记录失败；仍继续执行必要的停止收尾")
 
+    def _on_real_send_started(self, request: RallyControlRequest) -> None:
+        """Record the worker's coordinated send boundary for a Start."""
+        if request.command != RALLY_START_COMMAND:
+            return
+        with self._lock:
+            self._real_start_send_attempts.add(request.request_id)
+            if self._real_inflight is request:
+                self._real_runtime_state = "STARTING"
+
     def _on_real_sent(self, request: RallyControlRequest, sent_ns: int) -> None:
         with self._lock:
-            if self._real_inflight is request:
-                self._real_runtime_state = (
-                    "STARTING" if request.command == RALLY_START_COMMAND else "STOPPING"
+            self._real_start_send_attempts.discard(request.request_id)
+            self._real_superseded_unsent.discard(request.request_id)
+            if request.command == RALLY_START_COMMAND:
+                self._real_start_responsibilities[request.request_id] = (
+                    request.session_id,
+                    request.generation,
                 )
-            self._real_last_request = {
-                "request_id": request.request_id,
-                "command": request.command,
-                "status": RequestStatus.WAITING_RESPONSE.value,
-                "sent_monotonic_ns": sent_ns,
-                "block_id": request.block_id,
-                "model": request.model,
-            }
-        event = self._build_real_transport_event(request, "sent")
+            is_current = (
+                self._real_inflight is request
+                and request.session_id == self._real_session_id
+                and request.generation == self._real_generation
+            )
+            if is_current:
+                if request.command == RALLY_START_COMMAND:
+                    self._real_runtime_state = "STARTING"
+                elif request.command == RALLY_APPLY_COMMAND:
+                    self._paradigm_switch_started_monotonic_ns = sent_ns
+                    self._real_runtime_state = (
+                        f"SWITCHING({self._paradigm_confirmed_protocol},{request.protocol_name})"
+                        if self._paradigm_confirmed_protocol is not None
+                        else f"APPLYING({request.protocol_name})"
+                    )
+                else:
+                    self._real_runtime_state = "STOPPING"
+                self._real_last_request = {
+                    "request_id": request.request_id,
+                    "command": request.command,
+                    "protocol_name": request.protocol_name,
+                    "protocol_sha256": request.protocol_sha256,
+                    "status": RequestStatus.WAITING_RESPONSE.value,
+                    "sent_monotonic_ns": sent_ns,
+                    "block_id": request.block_id,
+                    "model": request.model,
+                }
+        event = self._build_real_transport_event(
+            request, "sent", sent_monotonic_ns=sent_ns
+        )
         self._remember_control_event(event)
         self.request_changed.emit(
             {
@@ -1033,46 +1835,152 @@ class StimulationRuntime(QObject):
         *,
         pipeline_override=None,
     ) -> None:
+        reason_text = str(reason)
+        reason_code = (
+            reason.code if isinstance(reason, RallyControlNotSentReason) else "unspecified"
+        )
         with self._lock:
-            self._real_inflight = None
+            is_current = self._real_inflight is request
+            if is_current:
+                self._real_inflight = None
             lease = self._real_leases.pop(request.request_id, None)
             pipeline = lease if lease is not None else pipeline_override
             if pipeline is None:
                 pipeline = self._pipeline
             close_after = self._real_close_requested
-            expected_stop = request.command == RALLY_STOP_COMMAND
-            cancelled_start_for_stop = (
-                request.command == RALLY_START_COMMAND and self._real_stop_after_current
-            )
-            if cancelled_start_for_stop:
-                self._real_stop_after_current = False
-                self._real_runtime_state = "STOPPING"
-                next_request = self._new_real_request_locked(
-                    RALLY_STOP_COMMAND,
-                    "停止优先：未发送的 Start Stim 已取消，执行 Stop Stim",
-                    block_id=None,
-                    stage=None,
-                    model=None,
-                )
-                self._real_inflight = next_request
-            else:
-                next_request = None
-        if expected_stop and not cancelled_start_for_stop:
-            failure_request, shutdown_after = self._finish_real_failure(
-                request, status, reason
-            )
-            next_request = failure_request
-        elif request.command == RALLY_START_COMMAND and not cancelled_start_for_stop:
-            failure_request, shutdown_after = self._finish_real_failure(
-                request, status, reason
-            )
-            next_request = failure_request
-        else:
+            start_was_sent = request.request_id in self._real_start_responsibilities
+            stop_priority_cancel = self._real_stop_after_current
+            superseded_marker = request.request_id in self._real_superseded_unsent
+            self._real_superseded_unsent.discard(request.request_id)
+            self._real_start_send_attempts.discard(request.request_id)
+            next_request = None
             shutdown_after = False
+        if not is_current:
+            event = self._build_real_transport_event(
+                request, "outcome", status=status.value
+            )
+            event["payload"]["reason"] = reason_text
+            self._remember_control_event(event)
+            self._release_real_lease(lease)
+            return
+        if request.command == RALLY_STOP_COMMAND:
+            next_request, shutdown_after = self._finish_real_failure(
+                request, status, reason_text
+            )
+        else:
+            with self._lock:
+                now_ns = self._monotonic_ns()
+                expiry = self._paradigm_expiry_monotonic_ns
+                expired = (
+                    request.command != RALLY_STOP_COMMAND
+                    and self._real_profile == "paradigm"
+                    and (
+                        self._paradigm_expired
+                        or reason_code == "expired"
+                        or (expiry is not None and now_ns >= expiry)
+                    )
+                )
+                superseded = (
+                    request.command == RALLY_APPLY_COMMAND
+                    and status is RequestStatus.NOT_SENT
+                    and (reason_code == "superseded" or superseded_marker)
+                    and self._real_profile == "paradigm"
+                    and self._control_mode == "real"
+                    and self._real_auto_enabled
+                    and not self._real_close_requested
+                    and not self._real_shutdown_requested
+                    and not self._real_stop_after_current
+                    and not self._paradigm_expired
+                    and request.session_id == self._real_session_id
+                    and request.generation == self._real_generation
+                    and self._paradigm_latest_desired is not None
+                    and (expiry is None or now_ns < expiry)
+                    and self._real_cached_result_is_eligible_locked(now_ns=now_ns)
+                )
+            if expired:
+                event = self._build_real_transport_event(
+                    request, "outcome", status=status.value
+                )
+                event["payload"]["reason"] = reason_text
+                self._remember_control_event(event)
+                self._expire_paradigm(
+                    f"发送前检查发现估计 SD 已到期：{reason_text}",
+                    lease=lease,
+                    pipeline_override=pipeline,
+                )
+                if self._real_inflight is None and (
+                    close_after or self._real_shutdown_requested
+                ):
+                    self._real_transport.shutdown()
+                self.request_changed.emit(
+                    {
+                        "mode": "real",
+                        "request_id": request.request_id,
+                        "command": request.command,
+                        "status": status.value,
+                        "message": reason_text,
+                        "block_id": request.block_id,
+                    }
+                )
+                self._emit_real_status()
+                self._refresh_activity()
+                return
+            if stop_priority_cancel:
+                with self._lock:
+                    self._real_stop_after_current = False
+                    self._real_expected_state = "STOPPED"
+                    self._real_desired_state = "STOPPED"
+                    if self._real_profile == "paradigm":
+                        self._paradigm_latest_desired = None
+                    has_start_responsibility = bool(
+                        self._real_start_responsibilities
+                        or self._real_confirmed_state == "RUNNING"
+                    )
+                    if has_start_responsibility:
+                        next_request = self._new_real_request_locked(
+                            RALLY_STOP_COMMAND,
+                            f"{request.command} 未发送且 Stop 优先；执行一次必要 Stop",
+                            block_id=None,
+                            stage=None,
+                            model=None,
+                        )
+                        self._real_inflight = next_request
+                        self._real_runtime_state = "STOPPING"
+                    else:
+                        self._real_runtime_state = (
+                            "ARMED/IDLE"
+                            if self._real_auto_enabled
+                            else (
+                                "STOPPED"
+                                if self._real_confirmed_state == "STOPPED"
+                                else "DISARMED/UNKNOWN"
+                            )
+                        )
+                    shutdown_after = self._real_shutdown_requested
+            elif superseded:
+                with self._lock:
+                    latest = self._real_latest_valid_result_locked()
+                    if latest is not None:
+                        result, _context = latest
+                        next_request = self._plan_paradigm_request_locked(
+                            self._paradigm_latest_desired,
+                            reason="旧 Apply 被新合格期别明确替代；仅按最新期别重算一次",
+                            block_id=result.block_id,
+                            stage=result.stage,
+                            model=result.model.to_dict(),
+                        )
+                    shutdown_after = self._real_shutdown_requested
+            else:
+                next_request, shutdown_after = self._finish_real_failure(
+                    request,
+                    status,
+                    reason_text,
+                    start_was_sent=(start_was_sent if request.command == RALLY_START_COMMAND else None),
+                )
         event = self._build_real_transport_event(
             request, "outcome", status=status.value
         )
-        event["payload"]["reason"] = reason
+        event["payload"]["reason"] = reason_text
         self._remember_control_event(event)
         if next_request is not None:
             self._submit_real_request(
@@ -1091,7 +1999,7 @@ class StimulationRuntime(QObject):
                 "request_id": request.request_id,
                 "command": request.command,
                 "status": status.value,
-                "message": reason,
+                "message": reason_text,
                 "block_id": request.block_id,
             }
         )
@@ -1102,10 +2010,14 @@ class StimulationRuntime(QObject):
         self, request: RallyControlRequest, outcome: RallyControlOutcome
     ) -> None:
         with self._lock:
-            self._real_inflight = None
+            is_current = self._real_inflight is request
+            if is_current:
+                self._real_inflight = None
             lease = self._real_leases.pop(request.request_id, None)
             pipeline = lease if lease is not None else self._pipeline
             current_request = (
+                is_current
+                and
                 request.generation == self._real_generation
                 and request.session_id == self._real_session_id
             )
@@ -1161,7 +2073,9 @@ class StimulationRuntime(QObject):
         disabled_detail: str | None = None
         with self._lock:
             self._real_confirmed_state = (
-                "RUNNING" if request.command == RALLY_START_COMMAND else "STOPPED"
+                "RUNNING"
+                if request.command in {RALLY_START_COMMAND, RALLY_APPLY_COMMAND}
+                else "STOPPED"
             )
             self._real_confirmed_utc = utc_now_iso()
             self._real_last_outcome = {
@@ -1178,25 +2092,29 @@ class StimulationRuntime(QObject):
                 "received_monotonic_ns": outcome.received_monotonic_ns,
             }
             if request.command == RALLY_STOP_COMMAND:
-                self._real_runtime_state = "STOPPED"
-                is_baseline = "安全基线" in request.reason
-                if is_baseline:
-                    self._real_baseline_ready = True
-                    self._real_seen_block_id = max(
-                        self._real_seen_block_id, self._real_last_valid_block_id
+                # A successful Stop is the only software evidence that
+                # clears Start stop-responsibility.  Enabling itself never
+                # enters this branch.
+                self._real_start_responsibilities.clear()
+                self._real_start_send_attempts.clear()
+                self._real_independent_stop_required = False
+                self._paradigm_confirmed_protocol = None
+                self._paradigm_expiry_monotonic_ns = None
+                self._paradigm_expiry_utc = None
+                self._real_runtime_state = (
+                    "EXPIRED/UNKNOWN"
+                    if self._paradigm_expired
+                    else (
+                        "ARMED/IDLE"
+                        if self._real_auto_enabled and not self._real_close_requested
+                        else "STOPPED"
                     )
-                    self._real_last_valid_block_id = self._real_seen_block_id
-                    if self._real_auto_enabled:
-                        auto_detail = (
-                            "真实 Rally 自动控制已启用；Stop Stim 基线已精确确认，"
-                            "等待下一条合格当前 ONNX 结果"
-                        )
+                )
                 self._real_stop_after_current = False
                 follow = (
                     self._real_auto_enabled
                     and not self._real_close_requested
                     and self._real_desired_state == "RUNNING"
-                    and not is_baseline
                 )
                 if follow:
                     now_ns = self._monotonic_ns()
@@ -1204,13 +2122,22 @@ class StimulationRuntime(QObject):
                         latest = self._real_latest_valid_result_locked()
                         assert latest is not None
                         result, _context = latest
-                        follow_request = self._plan_real_request_locked(
-                            "RUNNING",
-                            reason="最新合格 ONNX 结果仍为目标期，Stop 完成后申请 Start Stim",
-                            block_id=result.block_id,
-                            stage=result.stage,
-                            model=result.model.to_dict(),
-                        )
+                        if self._real_profile == "paradigm":
+                            follow_request = self._plan_paradigm_request_locked(
+                                self._paradigm_latest_desired,
+                                reason="Stop 完成后按最新期别重新激活并 Apply 最新协议",
+                                block_id=result.block_id,
+                                stage=result.stage,
+                                model=result.model.to_dict(),
+                            )
+                        else:
+                            follow_request = self._plan_real_request_locked(
+                                "RUNNING",
+                                reason="最新合格 ONNX 结果仍为目标期，Stop 完成后申请 Start Stim",
+                                block_id=result.block_id,
+                                stage=result.stage,
+                                model=result.model.to_dict(),
+                            )
                     else:
                         self._real_auto_enabled = False
                         self._real_expected_state = "STOPPED"
@@ -1223,6 +2150,141 @@ class StimulationRuntime(QObject):
                         follow_request = None
                 else:
                     follow_request = None
+            elif request.command == RALLY_APPLY_COMMAND:
+                snapshot = self._paradigm_manager.session_snapshot
+                protocol = (
+                    snapshot.protocol_map.get(request.protocol_name)
+                    if snapshot is not None and request.protocol_name is not None
+                    else None
+                )
+                if protocol is None:
+                    self._real_auto_enabled = False
+                    self._real_runtime_state = "FAULT/UNKNOWN"
+                    follow_request = self._new_real_request_locked(
+                        RALLY_STOP_COMMAND,
+                        "Apply 成功回调无法关联冻结协议；保护性停止",
+                        block_id=None,
+                        stage=None,
+                        model=None,
+                    )
+                    self._real_inflight = follow_request
+                    self._real_runtime_state = "STOPPING"
+                else:
+                    self._paradigm_previous_confirmed_monotonic_ns = (
+                        self._real_confirmed_monotonic_ns
+                    )
+                    confirmed_ns = outcome.received_monotonic_ns or self._monotonic_ns()
+                    self._real_confirmed_monotonic_ns = confirmed_ns
+                    self._paradigm_confirmed_protocol = protocol.key
+                    self._paradigm_expiry_monotonic_ns = (
+                        confirmed_ns
+                        + int(
+                            float(protocol.payload["SD"])
+                            * float(protocol.sd_seconds_per_unit)
+                            * 1_000_000_000
+                        )
+                        if protocol.sd_seconds_per_unit is not None
+                        else None
+                    )
+                    self._paradigm_expiry_utc = (
+                        _utc_after_seconds(
+                            utc_now_iso(),
+                            float(protocol.payload["SD"])
+                            * float(protocol.sd_seconds_per_unit),
+                        )
+                        if protocol.sd_seconds_per_unit is not None
+                        else None
+                    )
+                    self._paradigm_switch_started_monotonic_ns = None
+                    if (
+                        not self._real_auto_enabled
+                        or self._real_stop_after_current
+                        or self._real_close_requested
+                        or self._paradigm_latest_desired is None
+                    ):
+                        follow_request = self._plan_paradigm_request_locked(
+                            None,
+                            reason="Apply 确认前 Stop 已取得优先权",
+                            block_id=None,
+                            stage=None,
+                            model=None,
+                        )
+                    else:
+                        latest = self._real_latest_valid_result_locked()
+                        if (
+                            latest is not None
+                            and self._real_cached_result_is_eligible_locked(
+                                now_ns=self._monotonic_ns()
+                            )
+                        ):
+                            result, _context = latest
+                            follow_request = self._plan_paradigm_request_locked(
+                                self._paradigm_latest_desired,
+                                reason="Apply 已确认；立即复核并采用最新期别期望",
+                                block_id=result.block_id,
+                                stage=result.stage,
+                                model=result.model.to_dict(),
+                            )
+                        else:
+                            self._real_auto_enabled = False
+                            self._real_operator_confirmed = False
+                            self._paradigm_latest_desired = None
+                            follow_request = self._plan_paradigm_request_locked(
+                                None,
+                                reason="Apply 后最新 ONNX 结果已过期；保护性停止",
+                                block_id=None,
+                                stage=None,
+                                model=None,
+                            )
+                    if follow_request is None and self._paradigm_confirmed_protocol is not None:
+                        self._real_runtime_state = "RUNNING"
+            elif request.command == RALLY_START_COMMAND and self._real_profile == "paradigm":
+                self._paradigm_start_confirmed_monotonic_ns = (
+                    outcome.received_monotonic_ns or self._monotonic_ns()
+                )
+                self._real_confirmed_monotonic_ns = self._paradigm_start_confirmed_monotonic_ns
+                follow_request = None
+                if (
+                    not self._real_auto_enabled
+                    or self._real_stop_after_current
+                    or self._real_close_requested
+                    or self._paradigm_latest_desired is None
+                ):
+                    self._real_runtime_state = "STOPPING"
+                    follow_request = self._plan_paradigm_request_locked(
+                        None,
+                        reason="Start 已确认但停止优先，立即执行必要 Stop",
+                        block_id=None,
+                        stage=None,
+                        model=None,
+                    )
+                else:
+                    latest = self._real_latest_valid_result_locked()
+                    if (
+                        latest is not None
+                        and self._real_cached_result_is_eligible_locked(
+                            now_ns=self._monotonic_ns()
+                        )
+                    ):
+                        result, _context = latest
+                        follow_request = self._plan_paradigm_request_locked(
+                            self._paradigm_latest_desired,
+                            reason="Start 已精确确认；复核后 Apply 最新期别协议",
+                            block_id=result.block_id,
+                            stage=result.stage,
+                            model=result.model.to_dict(),
+                        )
+                    else:
+                        self._real_auto_enabled = False
+                        self._real_operator_confirmed = False
+                        self._paradigm_latest_desired = None
+                        follow_request = self._plan_paradigm_request_locked(
+                            None,
+                            reason="Start 确认后最新结果已过期；保护性停止",
+                            block_id=None,
+                            stage=None,
+                            model=None,
+                        )
             else:
                 self._real_runtime_state = "RUNNING"
                 follow_request = None
@@ -1256,8 +2318,18 @@ class StimulationRuntime(QObject):
         reason: str,
         *,
         outcome: RallyControlOutcome | None = None,
+        start_was_sent: bool | None = None,
     ) -> tuple[RallyControlRequest | None, bool]:
         with self._lock:
+            if start_was_sent is None and request.command == RALLY_START_COMMAND:
+                start_was_sent = (
+                    request.request_id in self._real_start_responsibilities
+                    or request.request_id in self._real_start_send_attempts
+                    or (
+                        outcome is not None
+                        and outcome.sent_monotonic_ns is not None
+                    )
+                )
             self._real_last_outcome = {
                 "request_id": request.request_id,
                 "command": request.command,
@@ -1275,22 +2347,58 @@ class StimulationRuntime(QObject):
             }
             if request.command == RALLY_START_COMMAND:
                 self._real_auto_enabled = False
-                self._real_baseline_ready = False
+                self._real_operator_confirmed = False
                 self._real_expected_state = "STOPPED"
                 self._real_desired_state = "STOPPED"
                 self._real_runtime_state = "FAULT/UNKNOWN"
-                # A failed/unknown Start gets exactly one bounded Stop
-                # compensation, even when the prior confirmed state was Stop.
-                compensation = self._new_real_request_locked(
-                    RALLY_STOP_COMMAND,
-                    "Start Stim 未获明确成功，执行一次补偿 Stop Stim",
-                    block_id=None,
-                    stage=None,
-                    model=None,
+                self._real_stop_after_current = False
+                if start_was_sent and self._real_inflight is None:
+                    # A failed/unknown Start that reached the send boundary
+                    # gets exactly one bounded Stop compensation.  The map
+                    # entry is intentionally kept until that Stop succeeds.
+                    compensation = self._new_real_request_locked(
+                        RALLY_STOP_COMMAND,
+                        "Start Stim 已发送但未获明确成功，执行一次补偿 Stop Stim",
+                        block_id=None,
+                        stage=None,
+                        model=None,
+                    )
+                    self._real_inflight = compensation
+                else:
+                    compensation = None
+            elif request.command == RALLY_APPLY_COMMAND:
+                self._real_auto_enabled = False
+                self._real_operator_confirmed = False
+                self._real_expected_state = "STOPPED"
+                self._real_desired_state = "STOPPED"
+                self._paradigm_latest_desired = None
+                self._paradigm_confirmed_protocol = None
+                self._real_runtime_state = "FAULT/UNKNOWN"
+                self._real_stop_after_current = False
+                has_start_responsibility = bool(
+                    self._real_start_responsibilities
+                    or self._real_start_send_attempts
+                    or (
+                        outcome is not None
+                        and outcome.sent_monotonic_ns is not None
+                    )
                 )
-                self._real_inflight = compensation
+                if has_start_responsibility and self._real_inflight is None:
+                    compensation = self._new_real_request_locked(
+                        RALLY_STOP_COMMAND,
+                        "Apply 未获明确成功，目标协议不确认；执行一次保护性 Stop",
+                        block_id=None,
+                        stage=None,
+                        model=None,
+                    )
+                    self._real_inflight = compensation
+                    self._real_runtime_state = "STOPPING"
+                else:
+                    self._real_independent_stop_required = has_start_responsibility
+                    compensation = None
             else:
                 self._real_auto_enabled = False
+                self._real_operator_confirmed = False
                 self._real_expected_state = "STOPPED"
                 self._real_desired_state = "STOPPED"
                 self._real_runtime_state = "FAULT/UNKNOWN"
@@ -1324,6 +2432,7 @@ class StimulationRuntime(QObject):
         model_configured: bool = False,
     ) -> None:
         with self._lock:
+            self._paradigm_manager.begin_session()
             self._session_id = session_id
             self._pipeline = pipeline
             self._recording_enabled = recording_enabled
@@ -1338,14 +2447,23 @@ class StimulationRuntime(QObject):
             self._real_seen_block_id = 0
             self._real_last_valid_block_id = 0
             self._real_latest_valid = None
-            self._real_baseline_ready = False
+            self._real_armed_since_monotonic_ns = None
+            self._real_operator_confirmed = False
             self._real_stop_after_current = False
             self._real_close_requested = False
-            self._real_independent_stop_required = False
             self._real_confirmed_state = None
             self._real_confirmed_utc = None
             self._real_last_request = None
             self._real_last_outcome = None
+            self._paradigm_latest_desired = None
+            self._paradigm_confirmed_protocol = None
+            self._paradigm_expiry_monotonic_ns = None
+            self._paradigm_expiry_utc = None
+            self._paradigm_expired = False
+            self._paradigm_start_confirmed_monotonic_ns = None
+            self._paradigm_previous_confirmed_monotonic_ns = None
+            self._paradigm_switch_started_monotonic_ns = None
+            self._real_confirmed_monotonic_ns = None
             self._real_runtime_state = "DISARMED/UNKNOWN"
             self._real_expected_state = None
             self._real_desired_state = None
@@ -1369,11 +2487,13 @@ class StimulationRuntime(QObject):
             self._real_session_id = None
             self._real_handshake_ready = False
             self._real_model_configured = False
-            self._real_baseline_ready = False
+            self._real_operator_confirmed = False
             self._real_auto_enabled = False
+            self._real_armed_since_monotonic_ns = None
             self._real_expected_state = "STOPPED"
             self._real_desired_state = "STOPPED"
             self._real_runtime_state = "DISARMED/UNKNOWN"
+            self._paradigm_manager.end_session()
         self.automatic_status_changed.emit(False, "实时会话已结束；自动决策已关闭")
         self._refresh_activity()
         self._emit_real_status()
@@ -1754,3 +2874,13 @@ class StimulationRuntime(QObject):
             self._activity = active
         if changed:
             self.activity_changed.emit(active)
+
+
+def _utc_after_seconds(value: str, seconds: float) -> str:
+    """Format a UTC expiry estimate without implying physical device timing."""
+    instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return (instant + timedelta(seconds=seconds)).astimezone(timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")

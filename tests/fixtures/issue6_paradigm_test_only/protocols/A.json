@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "Synthetic protocol A",
+  "protocol_version": "test-only-1",
+  "classification": "synthetic/test-only",
+  "rally_base_protocol": "TEST_BASE_PROTOCOL_ONLY",
+  "initial_stimulus_channels": ["TEST_STIM_A", "TEST_STIM_B"],
+  "return_channels": ["TEST_RETURN"],
+  "sd_conversion": {
+    "seconds_per_sd_unit": 0.25,
+    "source": "Synthetic test clock units only; not a Rally unit definition"
+  },
+  "payload": {
+    "SD": 101,
+    "FR": 3,
+    "FD": 5,
+    "CHS": [{"N": "TEST_STIM_A", "T": "tD", "A": 0.125}]
+  }
+}

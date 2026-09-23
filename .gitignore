@@ -26,3 +26,6 @@ dist/
 /data/
 /outputs/
 /logs/
+
+# SQLite artifact produced by a local in-memory session test
+/:memory:.ses

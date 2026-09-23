@@ -8,6 +8,7 @@ cannot be mistaken for the reply to a later command.
 from __future__ import annotations
 
 import heapq
+import json
 import math
 import socket
 import threading
@@ -20,6 +21,7 @@ from typing import Callable, Sequence
 
 from .stimulation import (
     REALTIME_CONTROL_TOKEN,
+    RALLY_ERROR_MESSAGES,
     RequestStatus,
     StimulusRequest,
     ParsedRallyResponse,
@@ -581,6 +583,7 @@ REAL_RALLY_HOST = "127.0.0.1"
 REAL_RALLY_PORT = 8801
 RALLY_START_COMMAND = "Start Stim"
 RALLY_STOP_COMMAND = "Stop Stim"
+RALLY_APPLY_COMMAND = "RealTimeControl"
 RALLY_START_SUCCESS = "启动刺激成功"
 RALLY_STOP_SUCCESS = "停止刺激成功"
 
@@ -611,6 +614,7 @@ REAL_RALLY_ENDPOINT = RallyControlEndpoint()
 
 class RallyControlState(StrEnum):
     DISARMED_UNKNOWN = "DISARMED/UNKNOWN"
+    ARMED_IDLE = "ARMED/IDLE"
     STOPPED = "STOPPED"
     STARTING = "STARTING"
     RUNNING = "RUNNING"
@@ -620,7 +624,7 @@ class RallyControlState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class RallyControlRequest:
-    """One binary Rally start/stop request without a vendor request id."""
+    """One Rally lifecycle request without a vendor request id."""
 
     request_id: str
     session_id: str
@@ -636,14 +640,54 @@ class RallyControlRequest:
     runtime_state: str
     created_utc: str
     created_monotonic_ns: int
+    protocol_name: str | None = None
+    protocol_payload_json: str | None = None
+    protocol_sha256: str | None = None
+    protocol_payload_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if self.command not in {RALLY_START_COMMAND, RALLY_STOP_COMMAND}:
-            raise ValueError("Rally 控制命令必须是 Start Stim 或 Stop Stim")
+        if self.command not in {
+            RALLY_START_COMMAND,
+            RALLY_STOP_COMMAND,
+            RALLY_APPLY_COMMAND,
+        }:
+            raise ValueError("Rally 控制命令必须是 Start Stim、Stop Stim 或 RealTimeControl")
         if not self.request_id.strip() or not self.session_id.strip():
             raise ValueError("Rally 控制请求必须有 request_id 和 session_id")
         if self.desired_state not in {"RUNNING", "STOPPED"}:
             raise ValueError("Rally 控制请求 desired_state 无效")
+        if self.command == RALLY_APPLY_COMMAND:
+            if not isinstance(self.protocol_name, str) or not self.protocol_name.strip():
+                raise ValueError("RealTimeControl 请求必须有协议名称")
+            if not isinstance(self.protocol_payload_json, str):
+                raise ValueError("RealTimeControl 请求必须有冻结的 JSON payload")
+            try:
+                parsed = json.loads(self.protocol_payload_json)
+                canonical = json.dumps(
+                    parsed,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise ValueError(f"RealTimeControl payload JSON 无效：{exc}") from exc
+            if not isinstance(parsed, dict) or canonical != self.protocol_payload_json:
+                raise ValueError("RealTimeControl payload 必须是规范化紧凑 JSON")
+            if not isinstance(self.protocol_sha256, str) or not self.protocol_sha256.strip():
+                raise ValueError("RealTimeControl 请求必须关联协议 SHA-256")
+            if not isinstance(self.protocol_payload_sha256, str) or not self.protocol_payload_sha256.strip():
+                raise ValueError("RealTimeControl 请求必须关联 payload SHA-256")
+        elif any(
+            value is not None
+            for value in (
+                self.protocol_name,
+                self.protocol_payload_json,
+                self.protocol_sha256,
+                self.protocol_payload_sha256,
+            )
+        ):
+            raise ValueError("Start/Stop 请求不能携带协议 Apply payload")
         if self.block_id is not None and (
             isinstance(self.block_id, bool) or self.block_id <= 0
         ):
@@ -667,6 +711,17 @@ class RallyControlOutcome:
         return b64encode(self.raw_bytes).decode("ascii")
 
 
+class RallyControlNotSentReason(str):
+    """String-compatible transport rejection with a stable machine code."""
+
+    code: str
+
+    def __new__(cls, code: str, message: str) -> "RallyControlNotSentReason":
+        reason = super().__new__(cls, message)
+        reason.code = code
+        return reason
+
+
 def parse_rally_control_response(
     command: str, data: bytes
 ) -> RallyControlOutcome:
@@ -687,6 +742,28 @@ def parse_rally_control_response(
             "Rally 响应不是有效 UTF-8，结果未知",
             raw_bytes=raw,
         )
+    if command == RALLY_APPLY_COMMAND:
+        if text == "RALLY_ERROR_SUCCESS":
+            return RallyControlOutcome(
+                RequestStatus.API_SUCCESS,
+                "Rally 已精确确认 RealTimeControl API 成功（不证明物理输出）",
+                raw_text=text,
+                raw_bytes=raw,
+            )
+        if text in RALLY_ERROR_MESSAGES and text != "RALLY_ERROR_SUCCESS":
+            return RallyControlOutcome(
+                RequestStatus.API_REJECTED,
+                f"Rally 拒绝 RealTimeControl：{RALLY_ERROR_MESSAGES[text]}",
+                raw_text=text or None,
+                raw_bytes=raw,
+            )
+        return RallyControlOutcome(
+            RequestStatus.UNKNOWN,
+            f"无法解释 RealTimeControl 回复，结果未知：{text}",
+            raw_text=text or None,
+            raw_bytes=raw,
+        )
+
     success = (
         (command == RALLY_START_COMMAND and text == RALLY_START_SUCCESS)
         or (command == RALLY_STOP_COMMAND and text == RALLY_STOP_SUCCESS)
@@ -723,17 +800,22 @@ def parse_rally_control_response(
 class _ControlCommand:
     request: RallyControlRequest
     cancelled: threading.Event = field(default_factory=threading.Event)
+    send_started: bool = False
     sent: bool = False
 
 
-ControlBeforeSend = Callable[[RallyControlRequest, int], tuple[bool, str]]
+ControlBeforeSend = Callable[
+    [RallyControlRequest, int],
+    tuple[bool, str] | tuple[bool, str, str],
+]
+ControlOnSendStarted = Callable[[RallyControlRequest], None]
 ControlOnSent = Callable[[RallyControlRequest, int], None]
 ControlOnNotSent = Callable[[RallyControlRequest, str, RequestStatus], None]
 ControlOnOutcome = Callable[[RallyControlRequest, RallyControlOutcome], None]
 
 
 class RallyControlTransportWorker:
-    """Single-owner, bounded UDP worker for ``Start/Stop Stim``.
+    """Single-owner, bounded UDP worker for Start/Apply/Stop.
 
     It intentionally has no request-id matching.  Each command receives a
     distinct source socket that remains quarantined after timeout/outcome, so
@@ -745,6 +827,7 @@ class RallyControlTransportWorker:
         self,
         *,
         before_send: ControlBeforeSend | None = None,
+        on_send_started: ControlOnSendStarted | None = None,
         on_sent: ControlOnSent,
         on_not_sent: ControlOnNotSent,
         on_outcome: ControlOnOutcome,
@@ -753,6 +836,7 @@ class RallyControlTransportWorker:
         timeout_seconds: float = 1.0,
         endpoint: RallyControlEndpoint = REAL_RALLY_ENDPOINT,
         max_quarantined_sockets: int = 128,
+        socket_factory: Callable[[RallyControlRequest], socket.socket] | None = None,
     ) -> None:
         _validate_positive_timeout(timeout_seconds)
         if not isinstance(endpoint, RallyControlEndpoint):
@@ -766,6 +850,10 @@ class RallyControlTransportWorker:
         self.endpoint = endpoint
         self.max_quarantined_sockets = max_quarantined_sockets
         self._before_send = before_send
+        self._socket_factory = socket_factory or (
+            lambda _request: socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        )
+        self._on_send_started = on_send_started or (lambda _request: None)
         self._on_sent = on_sent
         self._on_not_sent = on_not_sent
         self._on_outcome = on_outcome
@@ -847,7 +935,11 @@ class RallyControlTransportWorker:
         with self._condition:
             if self._pending is not None:
                 self._pending.cancelled.set()
-            if self._current is not None and not self._current.sent:
+            if (
+                self._current is not None
+                and not self._current.sent
+                and not self._current.send_started
+            ):
                 self._current.cancelled.set()
             self._condition.notify_all()
             return self._pending.request if self._pending is not None else None
@@ -857,7 +949,11 @@ class RallyControlTransportWorker:
             self._shutdown = True
             if self._pending is not None:
                 self._pending.cancelled.set()
-            if self._current is not None and not self._current.sent:
+            if (
+                self._current is not None
+                and not self._current.sent
+                and not self._current.send_started
+            ):
                 self._current.cancelled.set()
             self._condition.notify_all()
 
@@ -890,8 +986,9 @@ class RallyControlTransportWorker:
                             ),
                         )
                     else:
-                        self._on_not_sent(
+                        self._notify_not_sent(
                             command.request,
+                            "transport_error",
                             f"Rally UDP 请求未发送：{exc}",
                             RequestStatus.UNKNOWN,
                         )
@@ -917,9 +1014,11 @@ class RallyControlTransportWorker:
     def _run_command(self, command: _ControlCommand) -> None:
         request = command.request
         if command.cancelled.is_set() or self._shutdown:
-            self._on_not_sent(request, "请求在发送前被取消", RequestStatus.NOT_SENT)
+            self._notify_not_sent(
+                request, "cancelled", "请求在发送前被取消", RequestStatus.NOT_SENT
+            )
             return
-        request_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        request_socket = self._socket_factory(request)
         try:
             request_socket.bind((REAL_RALLY_HOST, 0))
             request_socket.settimeout(0.05)
@@ -928,23 +1027,50 @@ class RallyControlTransportWorker:
             raise
         if command.cancelled.is_set() or self._shutdown:
             request_socket.close()
-            self._on_not_sent(request, "请求在发送前被取消", RequestStatus.NOT_SENT)
+            self._notify_not_sent(
+                request, "cancelled", "请求在发送前被取消", RequestStatus.NOT_SENT
+            )
             return
         if self._before_send is not None:
-            allowed, reason = self._before_send(request, time.monotonic_ns())
+            decision = self._before_send(request, time.monotonic_ns())
+            if len(decision) == 2:
+                allowed, reason = decision
+                reason_code = "before_send_rejected"
+            elif len(decision) == 3:
+                allowed, reason, reason_code = decision
+            else:
+                raise ValueError("before_send 必须返回 (allowed, reason[, reason_code])")
             if not allowed:
                 request_socket.close()
-                self._on_not_sent(request, reason, RequestStatus.NOT_SENT)
+                self._notify_not_sent(
+                    request, reason_code, reason, RequestStatus.NOT_SENT
+                )
                 return
+        # The worker owns the send boundary.  Once this flag is set, a
+        # concurrent cancel/shutdown may not reclassify the command as
+        # unsent, even though the actual sendto call and the on_sent callback
+        # have not completed yet.
+        with self._condition:
+            cancelled_before_send = command.cancelled.is_set() or self._shutdown
+            if not cancelled_before_send:
+                command.send_started = True
+        if cancelled_before_send:
+            request_socket.close()
+            self._notify_not_sent(
+                request, "cancelled", "请求在发送前被取消", RequestStatus.NOT_SENT
+            )
+            return
+        self._on_send_started(request)
         try:
             request_socket.sendto(
-                request.command.encode("utf-8"),
+                _real_control_wire_bytes(request),
                 (self.endpoint.host, self.endpoint.port),
             )
         except OSError as exc:
             request_socket.close()
-            self._on_not_sent(
+            self._notify_not_sent(
                 request,
+                "send_error",
                 f"Rally UDP sendto 失败，结果未知：{exc}",
                 RequestStatus.UNKNOWN,
             )
@@ -1016,6 +1142,18 @@ class RallyControlTransportWorker:
             return
 
 
+    def _notify_not_sent(
+        self,
+        request: RallyControlRequest,
+        code: str,
+        message: str,
+        status: RequestStatus,
+    ) -> None:
+        self._on_not_sent(
+            request, RallyControlNotSentReason(code, message), status
+        )
+
+
 def _validate_positive_timeout(seconds: float) -> None:
     if (
         isinstance(seconds, bool)
@@ -1024,3 +1162,10 @@ def _validate_positive_timeout(seconds: float) -> None:
         or seconds <= 0
     ):
         raise ValueError("timeout_seconds 必须是有限正数")
+
+
+def _real_control_wire_bytes(request: RallyControlRequest) -> bytes:
+    if request.command == RALLY_APPLY_COMMAND:
+        assert request.protocol_payload_json is not None
+        return f"{REALTIME_CONTROL_TOKEN} {request.protocol_payload_json}".encode("utf-8")
+    return request.command.encode("utf-8")

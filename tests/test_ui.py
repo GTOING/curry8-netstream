@@ -130,6 +130,54 @@ def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None
         window.close()
 
 
+def test_paradigm_profile_and_replay_are_explicitly_read_only(qapp) -> None:
+    window = MainWindow()
+    try:
+        assert window.rally_profile_combo.currentData() == "binary"
+        window.set_rally_mode("real")
+        window.set_rally_profile("paradigm")
+        assert window.rally_profile_combo.currentData() == "paradigm"
+        assert "Start + 最新协议 Apply" in window.stimulation_auto_checkbox.text()
+        assert "基础协议与所选范式包" in window.real_control_confirm_checkbox.text()
+        window.set_rally_status(
+            {
+                "mode": "real",
+                "profile": "paradigm",
+                "runtime_state": "SWITCHING(A,C)",
+                "enabled": True,
+                "latest_desired_protocol": "C",
+                "api_confirmed_protocol": "A",
+                "paradigm_name": "fixture",
+                "paradigm_version": "test-only-1",
+                "paradigm_classification": "synthetic/test-only",
+                "endpoint": "127.0.0.1:8801",
+                "physical_output_confirmed": False,
+            }
+        )
+        assert "SWITCHING(A,C)" in window.rally_control_status_label.text()
+        assert "latest desired=C" in window.rally_control_status_label.text()
+        window.set_replay_mode(True, "回放只读")
+        window.set_replay_control_events(
+            [
+                {
+                    "event_type": "paradigm_control",
+                    "block_id": None,
+                    "payload": {
+                        "phase": "outcome",
+                        "action": "apply",
+                        "desired_protocol": "C",
+                        "api_confirmed_protocol": "C",
+                        "outcome": "api_success",
+                    },
+                }
+            ]
+        )
+        assert "仅展示，不发送" in window.stimulation_recent_label.text()
+        assert "范式 apply" in window.stimulation_recent_label.text()
+    finally:
+        window.close()
+
+
 def test_live_assembly_progress_is_readable_and_replay_does_not_overwrite(qapp):
     from sleep_stim_controller.epoching import EpochAssemblySnapshot
 
