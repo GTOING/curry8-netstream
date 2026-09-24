@@ -10,9 +10,11 @@ import math
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TypeVar
 
-from PySide6.QtCore import QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QFormLayout,
@@ -46,6 +48,8 @@ from .stimulation import (
     TriggerMode,
     load_protocol_scheme,
 )
+
+_TargetWidget = TypeVar("_TargetWidget", bound=QObject)
 
 
 class CollapsibleSection(QWidget):
@@ -90,6 +94,116 @@ class PathSummary(QPlainTextEdit):
 
     def setText(self, text: str) -> None:
         self.setPlainText(text)
+
+
+class _WheelScrollGuard(QObject):
+    """Keep wheel input from changing settings while preserving scrolling."""
+
+    def __init__(
+        self,
+        settings_scroll: QScrollArea,
+        controls: Sequence[QWidget],
+        scrollable_contents: Sequence[tuple[QWidget, QScrollArea]] = (),
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._settings_scroll = settings_scroll
+        self._control_targets: dict[QObject, QWidget] = {}
+        self._popup_targets: dict[QObject, QComboBox] = {}
+        self._scroll_area_targets: dict[QObject, QScrollArea] = {}
+        self._fractional_scroll: dict[QObject, float] = {}
+        for control in controls:
+            self._install_tree(control, self._control_targets, control)
+            if isinstance(control, QComboBox):
+                view = control.view()
+                self._install_tree(view.window(), self._popup_targets, control)
+                self._install_tree(view, self._popup_targets, control)
+        for content, scroll_area in scrollable_contents:
+            self._install_tree(content, self._scroll_area_targets, scroll_area)
+
+    def _install_tree(
+        self,
+        root: QObject,
+        targets: dict[QObject, _TargetWidget],
+        target: _TargetWidget,
+    ) -> None:
+        pending = [root]
+        while pending:
+            current = pending.pop()
+            if current in targets:
+                continue
+            targets[current] = target
+            current.installEventFilter(self)
+            pending.extend(current.children())
+
+    def eventFilter(self, watched: QObject, event) -> bool:
+        if event.type() != QEvent.Type.Wheel:
+            return False
+
+        popup_combo = self._popup_targets.get(watched)
+        if popup_combo is not None:
+            if popup_combo.view().isVisible():
+                self._scroll_popup(popup_combo, event)
+            else:
+                event.accept()
+            return True
+
+        scroll_area = self._scroll_area_targets.get(watched)
+        if scroll_area is not None:
+            self._scroll_bar(
+                scroll_area.verticalScrollBar(), event, popup_view=None
+            )
+            return True
+
+        control = self._control_targets.get(watched)
+        if control is None:
+            return False
+        if isinstance(control, QComboBox) and control.view().isVisible():
+            self._scroll_popup(control, event)
+        else:
+            self._scroll_bar(
+                self._settings_scroll.verticalScrollBar(), event, popup_view=None
+            )
+        return True
+
+    def _scroll_popup(self, combo: QComboBox, event) -> None:
+        view = combo.view()
+        self._scroll_bar(view.verticalScrollBar(), event, popup_view=view)
+
+    def _scroll_bar(self, scrollbar, event, *, popup_view) -> None:
+        pixel_y = event.pixelDelta().y()
+        if pixel_y:
+            delta = float(pixel_y)
+            if (
+                popup_view is not None
+                and popup_view.verticalScrollMode()
+                == QAbstractItemView.ScrollMode.ScrollPerItem
+            ):
+                row_height = max(popup_view.sizeHintForRow(0), 1)
+                delta = delta / row_height * max(scrollbar.singleStep(), 1)
+        else:
+            angle_y = event.angleDelta().y()
+            if not angle_y:
+                event.accept()
+                return
+            minimum_step = 1 if popup_view is not None else 16
+            delta = (
+                angle_y
+                / 120.0
+                * max(scrollbar.singleStep(), minimum_step)
+                * 3
+            )
+
+        key = scrollbar
+        delta += self._fractional_scroll.get(key, 0.0)
+        units = math.trunc(delta)
+        self._fractional_scroll[key] = delta - units
+        requested = scrollbar.value() - units
+        value = min(max(requested, scrollbar.minimum()), scrollbar.maximum())
+        if value != requested:
+            self._fractional_scroll.pop(key, None)
+        scrollbar.setValue(value)
+        event.accept()
 
 
 class MainWindow(QMainWindow):
@@ -583,6 +697,18 @@ class MainWindow(QMainWindow):
         settings_layout.addStretch()
         self.settings_scroll.setWidget(settings)
         operator_layout.addWidget(self.settings_scroll, 1)
+        self._wheel_scroll_guard = _WheelScrollGuard(
+            self.settings_scroll,
+            (
+                self.rally_mode_combo,
+                self.rally_profile_combo,
+                self.stimulation_strategy_combo,
+                self.port_spin,
+                self.replay_index_spin,
+            ),
+            scrollable_contents=((self.error_label, self.error_scroll),),
+            parent=self,
+        )
 
         self.setStyleSheet("""
             QMainWindow { background: #f3f5f7; }
