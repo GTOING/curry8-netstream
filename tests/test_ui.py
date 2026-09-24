@@ -23,6 +23,32 @@ def test_application_starts_and_closes_with_no_model_selected(qapp) -> None:
     assert not controller.is_busy()
 
 
+def test_stage_csv_option_requires_recording_locks_and_reports_failure(qapp) -> None:
+    window = MainWindow()
+    try:
+        assert not window.stage_csv_checkbox.isChecked()
+        assert not window.stage_csv_checkbox.isEnabled()
+        assert window.configuration()["stage_csv_enabled"] is False
+        window.recording_checkbox.setChecked(True)
+        assert window.stage_csv_checkbox.isEnabled()
+        window.stage_csv_checkbox.setChecked(True)
+        assert window.configuration()["stage_csv_enabled"] is True
+        window.set_busy(True)
+        assert not window.recording_checkbox.isEnabled()
+        assert not window.stage_csv_checkbox.isEnabled()
+        window.set_stage_csv_status(
+            "自动 CSV 导出失败/不完整：fixture disk failure；权威 JSONL/NPY 仍继续记录"
+        )
+        assert "fixture disk failure" in window.stage_csv_status_label.text()
+        window.set_busy(False)
+        window.recording_checkbox.setChecked(False)
+        assert not window.stage_csv_checkbox.isChecked()
+        assert not window.stage_csv_checkbox.isEnabled()
+        assert window.configuration()["stage_csv_enabled"] is False
+    finally:
+        window.close()
+
+
 def test_model_configuration_rejects_missing_or_wrong_extension(qapp, tmp_path) -> None:
     window = MainWindow()
     try:
@@ -89,6 +115,7 @@ def test_console_has_fixed_controls_and_metadata_without_waveforms(qapp) -> None
         assert window.connect_button.isEnabled()
         assert not window.disconnect_button.isEnabled()
         assert window.configuration()["recording_enabled"] is False
+        assert window.configuration()["stage_csv_enabled"] is False
         assert window.configuration()["recording_root"] is None
 
         window.show()

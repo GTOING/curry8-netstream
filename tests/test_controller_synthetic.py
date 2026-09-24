@@ -266,6 +266,9 @@ class SyntheticCurryServer:
         if self.mode == "nonfinite":
             connection.sendall(self._nonfinite_block_frame())
             return
+        if self.mode == "multi_window_packet":
+            connection.sendall(self._block_frame(self.sample_origin, n_samples=750))
+            return
         first = self._block_frame(self.sample_origin)
         step = (
             3000
@@ -439,25 +442,33 @@ def test_short_curry_packets_are_assembled_into_windows_and_recorded(
     qapp, tmp_path, monkeypatch
 ) -> None:
     """Exercise real TCP framing plus sample-point window assembly."""
+    import csv
     import json
 
     from sleep_stim_controller.recording import SessionReader
 
-    utc_values = iter(f"packet-{index}" for index in range(1, 10))
+    from datetime import datetime, timedelta, timezone
+
     mono_values = iter(range(1001, 1010))
     from types import SimpleNamespace
 
     monkeypatch.setattr(
-        "sleep_stim_controller.controller.utc_now_iso",
-        lambda: next(utc_values),
-    )
-    monkeypatch.setattr(
         "sleep_stim_controller.controller.time",
         SimpleNamespace(monotonic_ns=lambda: next(mono_values)),
     )
+    base_local = datetime(
+        2026, 9, 24, 17, 30, 0, 123000,
+        tzinfo=timezone(timedelta(hours=5, minutes=30)),
+    )
+    wall_reads = []
+
+    def controlled_wall_clock():
+        wall_reads.append(len(wall_reads))
+        return base_local + timedelta(seconds=wall_reads[-1])
+
     results = []
     with SyntheticCurryServer("short_packets", sample_origin=100) as server:
-        controller = CurrySessionController()
+        controller = CurrySessionController(wall_clock=controlled_wall_clock)
         controller.processing_changed.connect(
             lambda result: results.append(result) if result is not None else None
         )
@@ -466,6 +477,7 @@ def test_short_curry_packets_are_assembled_into_windows_and_recorded(
             server.port,
             recording_enabled=True,
             recording_root=tmp_path,
+            stage_csv_enabled=True,
         )
         assert wait_until(
             qapp,
@@ -490,6 +502,7 @@ def test_short_curry_packets_are_assembled_into_windows_and_recorded(
     session_path = Path(controller.session_path)
     reader = SessionReader(session_path)
     assert [entry.start_sample for entry in reader.entries] == [100, 400]
+    assert len(wall_reads) == 5
     expected = np.arange(2 * 800, dtype=np.float32).reshape(800, 2) + 200
     first, _ = reader.read_block(0)
     second, _ = reader.read_block(1)
@@ -512,13 +525,219 @@ def test_short_curry_packets_are_assembled_into_windows_and_recorded(
     ]
     block_events = [event for event in events if event["event_type"] == "block_saved"]
     assert [event["payload"]["received_utc"] for event in block_events] == [
-        "packet-2",
-        "packet-4",
+        "2026-09-24T12:00:01.123Z",
+        "2026-09-24T12:00:03.123Z",
     ]
     assert [event["payload"]["received_monotonic_ns"] for event in block_events] == [
         1002,
         1004,
     ]
+    local_values = [event["payload"]["window_received_local_iso"] for event in block_events]
+    assert local_values == [
+        "2026-09-24T17:30:01.123+05:30",
+        "2026-09-24T17:30:03.123+05:30",
+    ]
+    with (session_path / "stage_labels.csv").open(
+        encoding="utf-8-sig", newline=""
+    ) as source:
+        csv_rows = list(csv.DictReader(source))
+    assert [row["window_received_local_iso"] for row in csv_rows] == local_values
+    assert [row["received_utc"] for row in csv_rows] == [
+        event["payload"]["received_utc"] for event in block_events
+    ]
+
+
+def test_one_tcp_packet_finishing_multiple_windows_shares_one_local_timestamp(
+    qapp, tmp_path
+) -> None:
+    import csv
+    from sleep_stim_controller.recording import SessionReader
+
+    from datetime import datetime, timedelta, timezone
+
+    base_local = datetime(
+        2026, 9, 24, 23, 15, 0, tzinfo=timezone(timedelta(hours=-4))
+    )
+    calls = []
+
+    def clock():
+        calls.append(1)
+        return base_local
+
+    with SyntheticCurryServer("multi_window_packet", sample_origin=9000) as server:
+        controller = CurrySessionController(wall_clock=clock)
+        assert controller.connect(
+            "127.0.0.1",
+            server.port,
+            recording_enabled=True,
+            recording_root=tmp_path,
+            stage_csv_enabled=True,
+        )
+        assert wait_until(
+            qapp,
+            lambda: controller.assembly_snapshot is not None
+            and controller.assembly_snapshot.completed_windows == 2
+            and controller.latest_processing is not None
+            and controller.latest_processing.block_id == 2,
+        )
+        assert len(calls) == 1
+        assert controller.disconnect()
+        assert wait_until(qapp, lambda: controller.resources_released())
+
+    session_path = Path(controller.session_path)
+    reader = SessionReader(session_path)
+    assert [entry.start_sample for entry in reader.entries] == [9000, 9300]
+    assert [entry.window_received_local_iso for entry in reader.entries] == [
+        base_local.isoformat(timespec="milliseconds"),
+        base_local.isoformat(timespec="milliseconds"),
+    ]
+    with (session_path / "stage_labels.csv").open(
+        encoding="utf-8-sig", newline=""
+    ) as source:
+        rows = list(csv.DictReader(source))
+    assert [row["block_id"] for row in rows] == ["1", "2"]
+    assert [row["relative_start_s"] for row in rows] == ["0", "30"]
+    assert [row["relative_end_s"] for row in rows] == ["30", "60"]
+    assert rows[0]["window_received_local_iso"] == rows[1]["window_received_local_iso"]
+
+
+def test_live_csv_flushes_per_result_before_eof_and_appends_same_file(
+    qapp, tmp_path
+) -> None:
+    import csv
+
+    from sleep_stim_controller.staging import ModelDescriptor, StagePrediction
+    from sleep_stim_controller.recording import SessionReader
+
+    second_started = threading.Event()
+    release_second = threading.Event()
+
+    class ControlledAdapter:
+        descriptor = ModelDescriptor(
+            "controlled-live-model",
+            "fixture-1",
+            is_test_double=True,
+            confidence_meaning="synthetic test score",
+        )
+
+        def prepare(self, _cancel_event) -> None:
+            return None
+
+        def predict(self, context, _block, _cancel_event):
+            if context.block_id == 1:
+                return StagePrediction("N2", 0.6)
+            second_started.set()
+            release_second.wait(3.0)
+            raise RuntimeError("controlled second-window failure")
+
+        def close(self, _cancel_event) -> None:
+            return None
+
+    adapter = ControlledAdapter()
+    controller = CurrySessionController()
+    with SyntheticCurryServer("short_packets_hold", sample_origin=1200) as server:
+        try:
+            assert controller.connect(
+                "127.0.0.1",
+                server.port,
+                recording_enabled=True,
+                recording_root=tmp_path,
+                stage_csv_enabled=True,
+                model_factory=lambda: adapter,
+            )
+            assert wait_until(qapp, lambda: second_started.is_set())
+            assert not server.done.is_set()
+            session_path = Path(controller.session_path)
+            csv_path = session_path / "stage_labels.csv"
+            with csv_path.open(encoding="utf-8-sig", newline="") as source:
+                first_rows = list(csv.DictReader(source))
+            assert [row["block_id"] for row in first_rows] == ["1"]
+            assert first_rows[0]["status"] == "success"
+            inode_before = csv_path.stat().st_ino
+
+            release_second.set()
+            assert wait_until(
+                qapp,
+                lambda: controller.latest_processing is not None
+                and controller.latest_processing.block_id == 2,
+            )
+            with csv_path.open(encoding="utf-8-sig", newline="") as source:
+                final_rows = list(csv.DictReader(source))
+            assert [row["block_id"] for row in final_rows] == ["1", "2"]
+            assert final_rows[1]["status"] == "failed"
+            assert csv_path.stat().st_ino == inode_before
+            assert not server.done.is_set()
+        finally:
+            release_second.set()
+            if controller.is_busy():
+                controller.disconnect()
+                assert wait_until(qapp, lambda: controller.resources_released())
+
+    session_reader = SessionReader(session_path)
+    assert [entry.processing_result["status"] for entry in session_reader.entries] == [
+        "success",
+        "failed",
+    ]
+
+
+def test_reconnect_with_auto_csv_creates_a_distinct_session_file_set(qapp, tmp_path) -> None:
+    import csv
+
+    controller = CurrySessionController()
+    session_paths = []
+    session_ids = []
+    for sample_origin in (100, 8000):
+        with SyntheticCurryServer("short_packets_eof", sample_origin=sample_origin) as server:
+            assert controller.connect(
+                "127.0.0.1",
+                server.port,
+                recording_enabled=True,
+                recording_root=tmp_path,
+                stage_csv_enabled=True,
+            )
+            assert wait_until(qapp, lambda: controller.resources_released())
+            session_paths.append(Path(controller.session_path))
+            session_ids.append(controller.session_id)
+    assert session_ids[0] != session_ids[1]
+    assert session_paths[0] != session_paths[1]
+    assert all((path / "stage_labels.csv").is_file() for path in session_paths)
+    first_samples = []
+    for path in session_paths:
+        with (path / "stage_labels.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as source:
+            rows = list(csv.DictReader(source))
+        assert len(rows) == 2
+        first_samples.append(rows[0]["start_sample"])
+    assert first_samples == ["100", "8000"]
+
+
+def test_automatic_csv_creation_failure_prevents_tcp_accept(qapp, tmp_path, monkeypatch) -> None:
+    import json
+
+    from sleep_stim_controller.recording import SessionWriter
+
+    def fail_csv_creation(_writer):
+        raise OSError("injected CSV creation failure")
+
+    monkeypatch.setattr(SessionWriter, "_create_stage_csv", fail_csv_creation)
+    with SyntheticCurryServer("idle") as server:
+        controller = CurrySessionController()
+        assert controller.connect(
+            "127.0.0.1",
+            server.port,
+            recording_enabled=True,
+            recording_root=tmp_path,
+            stage_csv_enabled=True,
+        )
+        assert wait_until(qapp, lambda: controller.resources_released())
+        assert not server.accepted.is_set()
+        assert controller.pipeline_outcome is not None
+        assert "injected CSV creation failure" in controller.pipeline_outcome.error
+        session_path = Path(controller.session_path)
+        manifest = json.loads((session_path / "manifest.json").read_text("utf-8"))
+        assert manifest["status"] == "failed"
+        assert manifest["stage_csv"]["status"] == "failed"
 
 
 def test_short_packet_progress_is_not_emitted_once_per_packet(qapp) -> None:
@@ -993,6 +1212,13 @@ def test_loopback_recording_and_window_wired_offline_replay(
             lambda: "离线回放" in window.data_status_label.text()
             and "block_id=1" in window.block_metadata_label.text(),
         )
+        assert window.export_stage_csv_button.isEnabled()
+        window.export_stage_csv_button.click()
+        assert wait_until(
+            qapp,
+            lambda: "已原子重建 2 个可验证前缀行" in window.stage_csv_status_label.text(),
+        )
+        assert (session_path / "stage_labels.csv").is_file()
         assert not window.connect_button.isEnabled()
         assert "未接入" in window.processing_status_label.text()
         assert not window.replay_previous_button.isEnabled()

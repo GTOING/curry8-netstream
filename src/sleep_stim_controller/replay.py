@@ -8,13 +8,14 @@ from PySide6.QtCore import QObject, Signal
 
 from curry_netstream.models import DataBlock
 
-from .recording import SessionReader
+from .recording import SessionReader, export_stage_labels_csv
 
 
 class SessionReplayWorker(QObject):
     opened = Signal(int, object, object)  # generation, overview, error
     block_loaded = Signal(int, int, int, object, object)
     block_error = Signal(int, int, int, str)
+    stage_csv_exported = Signal(int, object, object)
     closed = Signal(int)
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -24,6 +25,7 @@ class SessionReplayWorker(QObject):
         self._generation = 0
         self._request_token = 0
         self._pending_request: tuple[int, int] | None = None
+        self._pending_export = False
         self._stop_requested = False
         self._opened = False
         self._path: str | None = None
@@ -51,6 +53,7 @@ class SessionReplayWorker(QObject):
             generation = self._generation
             self._request_token = 0
             self._pending_request = None
+            self._pending_export = False
             self._stop_requested = False
             self._opened = False
             self._path = str(path)
@@ -74,6 +77,15 @@ class SessionReplayWorker(QObject):
             self._condition.notify_all()
             return token
 
+    def export_stage_csv(self) -> bool:
+        """Queue an atomic export on the existing read-only replay worker."""
+        with self._condition:
+            if not self._opened or self._stop_requested or self._pending_export:
+                return False
+            self._pending_export = True
+            self._condition.notify_all()
+            return True
+
     def close(self) -> None:
         with self._condition:
             if self._thread is None or not self._thread.is_alive():
@@ -81,6 +93,7 @@ class SessionReplayWorker(QObject):
             self._stop_requested = True
             self._request_token += 1
             self._pending_request = None
+            self._pending_export = False
             self._condition.notify_all()
 
     def _run(self, generation: int, path: str | None) -> None:
@@ -96,12 +109,33 @@ class SessionReplayWorker(QObject):
             if reader is not None:
                 while True:
                     with self._condition:
-                        while self._pending_request is None and not self._stop_requested:
+                        while (
+                            self._pending_request is None
+                            and not self._pending_export
+                            and not self._stop_requested
+                        ):
                             self._condition.wait()
                         if self._stop_requested:
                             break
-                        request = self._pending_request
-                        self._pending_request = None
+                        if self._pending_export:
+                            self._pending_export = False
+                            request = None
+                            export_requested = True
+                        else:
+                            request = self._pending_request
+                            self._pending_request = None
+                            export_requested = False
+                    if export_requested:
+                        try:
+                            destination, row_count = export_stage_labels_csv(reader)
+                            self.stage_csv_exported.emit(
+                                generation, (str(destination), row_count), None
+                            )
+                        except Exception as exc:
+                            self.stage_csv_exported.emit(
+                                generation, None, str(exc) or type(exc).__name__
+                            )
+                        continue
                     if request is None:
                         continue
                     token, index = request
@@ -125,5 +159,6 @@ class SessionReplayWorker(QObject):
             with self._condition:
                 self._opened = False
                 self._pending_request = None
+                self._pending_export = False
                 self._stop_requested = False
             self.closed.emit(generation)

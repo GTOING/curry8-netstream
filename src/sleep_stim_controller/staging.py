@@ -56,6 +56,7 @@ class BlockContext:
     block: DataBlock
     received_utc: str
     received_monotonic_ns: int
+    window_received_local_iso: str | None = None
 
     @property
     def start_sample(self) -> int:
@@ -83,6 +84,7 @@ class BlockContext:
             block=self.model_input_copy(),
             received_utc=self.received_utc,
             received_monotonic_ns=self.received_monotonic_ns,
+            window_received_local_iso=self.window_received_local_iso,
         )
 
 
@@ -201,6 +203,7 @@ class ProcessingPipeline:
         port: int,
         recording_enabled: bool,
         recording_root: str | Path | None,
+        stage_csv_enabled: bool = False,
         model_factory: Callable[[], ModelAdapter] = NoModelAdapter,
         pending_limit: int = DEFAULT_PENDING_BLOCK_LIMIT,
         on_ready: Callable[[BaseException | None], None] | None = None,
@@ -211,6 +214,7 @@ class ProcessingPipeline:
         on_stimulation_decision_recorded: Callable[[object], None] | None = None,
         on_fatal: Callable[[BaseException], None] | None = None,
         on_finished: Callable[[PipelineOutcome], None] | None = None,
+        on_stage_csv_status: Callable[[str], None] | None = None,
         session_event_limit: int = 64,
     ) -> None:
         if pending_limit < 1:
@@ -224,6 +228,9 @@ class ProcessingPipeline:
         self.port = int(port)
         self.recording_enabled = recording_enabled
         self.recording_root = Path(recording_root) if recording_root else None
+        self.stage_csv_enabled = bool(stage_csv_enabled)
+        if self.stage_csv_enabled and not self.recording_enabled:
+            raise ValueError("启用分期 CSV 时必须启用会话记录")
         self.model_factory = model_factory
         self.pending_limit = pending_limit
         self.on_ready = on_ready
@@ -232,6 +239,7 @@ class ProcessingPipeline:
         self.on_stimulation_decision_recorded = on_stimulation_decision_recorded
         self.on_fatal = on_fatal
         self.on_finished = on_finished
+        self.on_stage_csv_status = on_stage_csv_status
         self.session_event_limit = session_event_limit
 
         self.cancel_predictions = threading.Event()
@@ -539,7 +547,9 @@ class ProcessingPipeline:
                     host=self.host,
                     port=self.port,
                     descriptor=descriptor,
+                    stage_csv_enabled=self.stage_csv_enabled,
                 )
+                self._publish_stage_csv_status(writer)
             adapter = self.model_factory()
             descriptor = adapter.descriptor
             if writer is not None:
@@ -631,6 +641,7 @@ class ProcessingPipeline:
                     if writer is not None:
                         writer.set_model(result.model)
                         writer.save_processing_result(result)
+                        self._publish_stage_csv_status(writer)
                     self._completed_results += 1
                     in_flight = None
                     if self.on_result is not None:
@@ -734,6 +745,8 @@ class ProcessingPipeline:
                     final_error = final_error or exc
                     if self.on_fatal is not None:
                         self.on_fatal(exc)
+                finally:
+                    self._publish_stage_csv_status(writer)
             with self._condition:
                 self._closed = True
                 self._condition.notify_all()
@@ -754,6 +767,15 @@ class ProcessingPipeline:
                         stream_assembly=stream_assembly,
                     )
                 )
+
+    def _publish_stage_csv_status(self, writer) -> None:
+        if self.on_stage_csv_status is not None and writer.stage_csv_enabled:
+            try:
+                self.on_stage_csv_status(writer.stage_csv_status())
+            except Exception:
+                # UI/status reporting is secondary to the archive and control
+                # lifecycle; a broken observer must not stop the writer.
+                pass
 
     def _process_one(
         self,

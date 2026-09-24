@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QFileDialog
@@ -112,6 +113,7 @@ def build_application(
     controller.assembly_progress_changed.connect(window.set_assembly_progress)
     controller.processing_changed.connect(window.set_processing_result)
     controller.recording_changed.connect(window.set_recording_status)
+    controller.stage_csv_changed.connect(window.set_stage_csv_status)
     stimulation.simulator_status_changed.connect(window.set_simulator_status)
     stimulation.automatic_status_changed.connect(window.set_stimulation_auto_status)
     stimulation.rally_status_changed.connect(window.set_rally_status)
@@ -228,6 +230,18 @@ def build_application(
     window.replay_exit_requested.connect(close_replay)
     window.replay_index_requested.connect(request_replay_block)
 
+    def export_replay_stage_csv() -> None:
+        if controller.is_busy():
+            window.set_stage_csv_status("实时写者尚未退出；当前禁止重建")
+            return
+        window.set_stage_csv_export_busy(True)
+        window.set_stage_csv_status("正在校验 JSONL/NPY 有效前缀并原子重建…")
+        if not replay.export_stage_csv():
+            window.set_stage_csv_export_busy(False)
+            window.set_stage_csv_status("导出未启动：回放读取器尚未就绪")
+
+    window.replay_export_csv_requested.connect(export_replay_stage_csv)
+
     def replay_opened(generation: int, overview, error) -> None:
         if generation != replay.generation:
             return
@@ -238,6 +252,10 @@ def build_application(
             return
         replay_state["overview"] = overview
         window.set_replay_ready(overview)
+        csv_path = Path(overview.path) / "stage_labels.csv"
+        window.set_stage_csv_status(
+            f"回放会话 CSV：{'已存在，可重建' if csv_path.is_file() else '尚未生成，可导出'} · {csv_path}"
+        )
         window.set_replay_control_events(getattr(overview, "control_events", ()))
         if overview.block_count:
             request_replay_block(0)
@@ -278,9 +296,25 @@ def build_application(
 
         QTimer.singleShot(0, release_after_thread_exit)
 
+    def replay_stage_csv_exported(generation: int, result, error) -> None:
+        if generation != replay.generation:
+            return
+        window.set_stage_csv_export_busy(False)
+        if error is not None:
+            window.set_stage_csv_status(f"导出/重建失败：{error}")
+            return
+        if result is None:
+            window.set_stage_csv_status("导出失败：缺少输出结果")
+            return
+        path, row_count = result
+        window.set_stage_csv_status(
+            f"已原子重建 {row_count} 个可验证前缀行：{path}"
+        )
+
     replay.opened.connect(replay_opened)
     replay.block_loaded.connect(replay_block_loaded)
     replay.block_error.connect(replay_block_error)
+    replay.stage_csv_exported.connect(replay_stage_csv_exported)
     replay.closed.connect(replay_closed)
 
     poll_timer = QTimer(window)

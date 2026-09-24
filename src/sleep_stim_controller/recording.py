@@ -1,11 +1,13 @@
 """Versioned per-session writer and read-only, prefix-tolerant replay reader."""
 from __future__ import annotations
 
+import csv
 import json
 import os
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,24 @@ from .paradigm_control_schema import validate_paradigm_control_event
 
 
 SCHEMA_VERSION = 1
+STAGE_LABELS_CSV_NAME = "stage_labels.csv"
+STAGE_LABELS_CSV_COLUMNS = (
+    "session_id",
+    "block_id",
+    "start_sample",
+    "end_sample_exclusive",
+    "sample_rate_hz",
+    "relative_start_s",
+    "relative_end_s",
+    "window_received_local_iso",
+    "received_utc",
+    "local_time_source",
+    "status",
+    "stage",
+    "confidence",
+    "reason",
+    "model_id",
+)
 
 
 class SessionFormatError(ValueError):
@@ -42,12 +62,23 @@ class SessionWriter:
         host: str,
         port: int,
         descriptor: ModelDescriptor,
+        stage_csv_enabled: bool = False,
     ) -> None:
         self.path = path
         self.session_id = session_id
         self._sequence = 0
         self._saved_blocks = 0
         self._processing_results = 0
+        self.stage_csv_enabled = bool(stage_csv_enabled)
+        self.stage_csv_path = path / STAGE_LABELS_CSV_NAME
+        self.stage_csv_error: str | None = None
+        self._stage_csv_file = None
+        self._stage_csv_writer = None
+        self._stage_csv_rows = 0
+        self._stage_csv_written_blocks: set[int] = set()
+        self._stage_csv_contexts: dict[int, tuple[int, int, float, str, str]] = {}
+        self._first_window_start_sample: int | None = None
+        self._first_window_sample_rate_hz: float | None = None
         self._manifest: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "session_id": session_id,
@@ -70,6 +101,13 @@ class SessionWriter:
                 "unprocessed_blocks": 0,
             },
         }
+        if self.stage_csv_enabled:
+            self._manifest["stage_csv"] = {
+                "enabled": True,
+                "path": STAGE_LABELS_CSV_NAME,
+                "status": "creating",
+                "rows": 0,
+            }
         self._write_manifest()
         self._events = (path / "events.jsonl").open("a", encoding="utf-8", newline="\n")
 
@@ -82,6 +120,7 @@ class SessionWriter:
         host: str,
         port: int,
         descriptor: ModelDescriptor,
+        stage_csv_enabled: bool = False,
     ) -> "SessionWriter":
         parent = Path(root).expanduser()
         if not parent.is_dir():
@@ -89,13 +128,73 @@ class SessionWriter:
         path = parent / f"session_{session_id}"
         path.mkdir(exist_ok=False)
         (path / "blocks").mkdir()
-        return cls(
+        writer = cls(
             path,
             session_id=session_id,
             host=host,
             port=port,
             descriptor=descriptor,
+            stage_csv_enabled=stage_csv_enabled,
         )
+        if stage_csv_enabled:
+            try:
+                writer._create_stage_csv()
+            except Exception as exc:
+                writer._mark_stage_csv_failed(exc)
+                try:
+                    writer.finish(
+                        status="failed",
+                        reason=f"分期 CSV 创建失败：{exc}",
+                        accepted_blocks=0,
+                        rejected_blocks=0,
+                        completed_results=0,
+                        unprocessed_blocks=0,
+                    )
+                except Exception:
+                    writer.close()
+                raise
+        return writer
+
+    def _create_stage_csv(self) -> None:
+        handle = self.stage_csv_path.open(
+            "x", encoding="utf-8-sig", newline=""
+        )
+        self._stage_csv_file = handle
+        self._stage_csv_writer = csv.writer(handle)
+        self._stage_csv_writer.writerow(STAGE_LABELS_CSV_COLUMNS)
+        handle.flush()
+        self._manifest["stage_csv"].update(status="writing", rows=0)
+        self._write_manifest()
+
+    def stage_csv_status(self) -> str:
+        if self.stage_csv_error is not None:
+            return (
+                f"自动 CSV 导出失败/不完整：{self.stage_csv_error}；"
+                "权威 JSONL/NPY 仍继续记录"
+            )
+        return (
+            f"自动 CSV 已写入 {self._stage_csv_rows} 行：{self.stage_csv_path}"
+        )
+
+    def _mark_stage_csv_failed(self, exc: BaseException) -> None:
+        if self.stage_csv_error is None:
+            self.stage_csv_error = str(exc) or type(exc).__name__
+        metadata = self._manifest.get("stage_csv")
+        if isinstance(metadata, dict):
+            metadata.update(status="failed", rows=self._stage_csv_rows, error=self.stage_csv_error)
+            try:
+                self._write_manifest()
+            except Exception:
+                pass
+        self._stage_csv_contexts.clear()
+        handle = self._stage_csv_file
+        self._stage_csv_file = None
+        self._stage_csv_writer = None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
     def set_model(self, descriptor: ModelDescriptor) -> None:
         self._manifest["model"] = descriptor.to_dict()
@@ -138,6 +237,8 @@ class SessionWriter:
             "dtype": data.dtype.str,
             "units": "unknown",
         }
+        if context.window_received_local_iso:
+            payload["window_received_local_iso"] = context.window_received_local_iso
         self._append_event(
             "block_saved",
             block_id=context.block_id,
@@ -145,6 +246,17 @@ class SessionWriter:
             monotonic_ns=context.received_monotonic_ns,
             payload=payload,
         )
+        if self.stage_csv_enabled and self.stage_csv_error is None:
+            self._stage_csv_contexts[context.block_id] = (
+                context.start_sample,
+                context.end_sample_exclusive,
+                float(block.sample_rate_hz),
+                context.window_received_local_iso or "",
+                context.received_utc,
+            )
+            if self._first_window_start_sample is None:
+                self._first_window_start_sample = context.start_sample
+                self._first_window_sample_rate_hz = float(block.sample_rate_hz)
         self._saved_blocks += 1
         self._manifest["counts"]["saved_blocks"] = self._saved_blocks
         self._write_manifest()
@@ -160,6 +272,62 @@ class SessionWriter:
         self._processing_results += 1
         self._manifest["counts"]["processing_results"] = self._processing_results
         self._write_manifest()
+        if (
+            self.stage_csv_enabled
+            and self.stage_csv_error is None
+            and result.block_id not in self._stage_csv_written_blocks
+        ):
+            try:
+                self._append_stage_csv_result(result)
+            except Exception as exc:
+                # CSV is derived from the authoritative event/array archive.
+                # A failed append is visible but must not interrupt recording
+                # or the control-event drain (including a required Rally Stop).
+                self._mark_stage_csv_failed(exc)
+
+    def _append_stage_csv_result(self, result: ProcessingResult) -> None:
+        if self.stage_csv_error is not None:
+            return
+        if self._stage_csv_writer is None or self._stage_csv_file is None:
+            raise OSError("分期 CSV 写入句柄不可用")
+        context = self._stage_csv_contexts.get(result.block_id)
+        if context is None:
+            raise RuntimeError(f"block_id={result.block_id} 缺少已保存窗口元数据")
+        start_sample, end_sample_exclusive, sample_rate, local_iso, received_utc = context
+        if (
+            self._first_window_start_sample is None
+            or self._first_window_sample_rate_hz is None
+        ):
+            raise RuntimeError("分期 CSV 缺少原始采样率")
+        relative_start_s = (
+            start_sample - self._first_window_start_sample
+        ) / self._first_window_sample_rate_hz
+        relative_end_s = (
+            end_sample_exclusive - self._first_window_start_sample
+        ) / self._first_window_sample_rate_hz
+        self._stage_csv_writer.writerow(
+            _stage_csv_row(
+                session_id=self.session_id,
+                block_id=result.block_id,
+                start_sample=start_sample,
+                end_sample_exclusive=end_sample_exclusive,
+                sample_rate_hz=sample_rate,
+                relative_start_s=relative_start_s,
+                relative_end_s=relative_end_s,
+                window_received_local_iso=local_iso,
+                received_utc=received_utc,
+                status=result.status.value,
+                stage=result.stage,
+                confidence=result.confidence,
+                reason=result.reason,
+                model_id=result.model.model_id,
+            )
+        )
+        self._stage_csv_file.flush()
+        self._stage_csv_rows += 1
+        self._stage_csv_written_blocks.add(result.block_id)
+        self._stage_csv_contexts.pop(result.block_id, None)
+        self._manifest["stage_csv"].update(status="writing", rows=self._stage_csv_rows)
 
     def append_extension_event(self, event: dict[str, object]) -> None:
         """Append one optional P3 event through this existing single writer."""
@@ -239,6 +407,15 @@ class SessionWriter:
             self._events.flush()
         finally:
             self._events.close()
+            self._close_stage_csv()
+        if self.stage_csv_enabled:
+            metadata = self._manifest["stage_csv"]
+            metadata.update(
+                status="failed" if self.stage_csv_error is not None else "complete",
+                rows=self._stage_csv_rows,
+            )
+            if self.stage_csv_error is not None:
+                metadata["error"] = self.stage_csv_error
         self._manifest.update(
             {
                 "status": status,
@@ -254,6 +431,33 @@ class SessionWriter:
             }
         )
         self._write_manifest()
+
+    def _close_stage_csv(self) -> None:
+        handle = self._stage_csv_file
+        self._stage_csv_file = None
+        self._stage_csv_writer = None
+        if handle is None:
+            return
+        try:
+            handle.flush()
+        except Exception as exc:
+            self._mark_stage_csv_failed(exc)
+            try:
+                handle.close()
+            except Exception:
+                pass
+            return
+        try:
+            handle.close()
+        except Exception as exc:
+            self._mark_stage_csv_failed(exc)
+
+    def close(self) -> None:
+        """Best-effort close for construction failures before normal finish."""
+        self._close_stage_csv()
+        events = getattr(self, "_events", None)
+        if events is not None and not events.closed:
+            events.close()
 
     def _append_event(
         self,
@@ -310,6 +514,7 @@ class ReplayBlockEntry:
     processing_result: dict[str, Any] | None
     issue: str | None = None
     stimulation_events: tuple[dict[str, Any], ...] = ()
+    window_received_local_iso: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,6 +919,7 @@ class SessionReader:
                     processing_result=result,
                     issue=entry.issue,
                     stimulation_events=tuple(stimulation_events.get(block_id, ())),
+                    window_received_local_iso=entry.window_received_local_iso,
                 )
             )
         unfinished_requests = set(decisions_by_request) - request_outcomes
@@ -771,6 +977,13 @@ class SessionReader:
             dtype = str(payload["dtype"])
             received_utc = str(payload["received_utc"])
             received_ns = int(payload["received_monotonic_ns"])
+            local_iso = payload.get("window_received_local_iso")
+            if local_iso is not None:
+                if not isinstance(local_iso, str) or not local_iso.strip():
+                    raise ValueError("window_received_local_iso 必须是非空字符串")
+                parsed_local = datetime.fromisoformat(local_iso)
+                if parsed_local.tzinfo is None or parsed_local.utcoffset() is None:
+                    raise ValueError("window_received_local_iso 必须包含 UTC 偏移")
         except (KeyError, TypeError, ValueError) as exc:
             raise SessionFormatError(
                 f"events.jsonl 第 {line_number} 行块元数据无效：{exc}"
@@ -795,6 +1008,7 @@ class SessionReader:
             dtype=dtype,
             processing_result=None,
             issue=issue,
+            window_received_local_iso=(local_iso if isinstance(local_iso, str) else None),
         )
 
     def read_block(self, index: int) -> tuple[DataBlock, ReplayBlockEntry]:
@@ -822,3 +1036,110 @@ class SessionReader:
             ),
             entry,
         )
+
+
+def _stage_csv_row(
+    *,
+    session_id: str,
+    block_id: int,
+    start_sample: int,
+    end_sample_exclusive: int,
+    sample_rate_hz: float,
+    relative_start_s: float,
+    relative_end_s: float,
+    window_received_local_iso: str,
+    received_utc: str,
+    status: str,
+    stage: str | None,
+    confidence: float | None,
+    reason: str | None,
+    model_id: str,
+) -> tuple[str, ...]:
+    successful = status == "success"
+    local_iso = window_received_local_iso or ""
+    return (
+        session_id,
+        str(block_id),
+        str(start_sample),
+        str(end_sample_exclusive),
+        format(float(sample_rate_hz), ".12g"),
+        format(float(relative_start_s), ".12g"),
+        format(float(relative_end_s), ".12g"),
+        local_iso,
+        received_utc,
+        "captured_at_receive" if local_iso else "unavailable",
+        status,
+        stage or "" if successful else "",
+        format(float(confidence), ".12g")
+        if successful and confidence is not None
+        else "",
+        reason or "",
+        model_id,
+    )
+
+
+def export_stage_labels_csv(
+    session: SessionReader | str | Path,
+) -> tuple[Path, int]:
+    """Atomically rebuild the derived CSV from the verified session prefix.
+
+    Callers must ensure no live writer owns the session. The export reads and
+    validates source arrays/events only; it never modifies the v1 archive.
+    """
+    reader = session if isinstance(session, SessionReader) else SessionReader(session)
+    destination = reader.path / STAGE_LABELS_CSV_NAME
+    temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
+    row_count = 0
+    first_start: int | None = None
+    first_rate: float | None = None
+    try:
+        with temporary.open("x", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(STAGE_LABELS_CSV_COLUMNS)
+            for index, entry in enumerate(reader.entries):
+                if entry.issue is not None or entry.processing_result is None:
+                    break
+                try:
+                    reader.read_block(index)
+                except (OSError, SessionFormatError, ValueError):
+                    break
+                result = entry.processing_result
+                if first_start is None:
+                    first_start = entry.start_sample
+                    first_rate = entry.sample_rate_hz
+                if first_rate is None:
+                    break
+                model = result.get("model")
+                if not isinstance(model, dict):
+                    break
+                writer.writerow(
+                    _stage_csv_row(
+                        session_id=reader.manifest["session_id"],
+                        block_id=entry.block_id,
+                        start_sample=entry.start_sample,
+                        end_sample_exclusive=entry.end_sample_exclusive,
+                        sample_rate_hz=entry.sample_rate_hz,
+                        relative_start_s=(entry.start_sample - first_start) / first_rate,
+                        relative_end_s=(
+                            entry.end_sample_exclusive - first_start
+                        ) / first_rate,
+                        window_received_local_iso=entry.window_received_local_iso or "",
+                        received_utc=entry.received_utc,
+                        status=str(result["status"]),
+                        stage=result.get("stage"),
+                        confidence=result.get("confidence"),
+                        reason=result.get("reason"),
+                        model_id=str(model.get("model_id") or ""),
+                    )
+                )
+                row_count += 1
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return destination, row_count

@@ -2023,6 +2023,150 @@ def test_eof_close_and_record_failure_keep_required_stop_alive_until_outcome() -
         fixture.close()
 
 
+def test_stage_csv_failure_keeps_required_rally_stop_and_jsonl_result(
+    monkeypatch, tmp_path
+) -> None:
+    from sleep_stim_controller.staging import StagePrediction
+
+    original_append = SessionWriter._append_stage_csv_result
+    append_attempts: list[int] = []
+
+    def fail_first_csv_append(writer, result) -> None:
+        append_attempts.append(result.block_id)
+        if len(append_attempts) == 1:
+            raise OSError("injected derived CSV failure")
+        original_append(writer, result)
+
+    original_save_block = SessionWriter.save_block
+    context_sizes_after_save: list[tuple[int, int]] = []
+    writers: list[SessionWriter] = []
+
+    def track_saved_contexts(writer, context) -> None:
+        original_save_block(writer, context)
+        writers.append(writer)
+        context_sizes_after_save.append(
+            (context.block_id, len(writer._stage_csv_contexts))
+        )
+
+    monkeypatch.setattr(SessionWriter, "_append_stage_csv_result", fail_first_csv_append)
+    monkeypatch.setattr(SessionWriter, "save_block", track_saved_contexts)
+    fixture = BinaryRallyFixture(
+        [RALLY_START_SUCCESS.encode("utf-8"), RALLY_STOP_SUCCESS.encode("utf-8")]
+    )
+    statuses: list[str] = []
+    ready = threading.Event()
+    csv_failed = threading.Event()
+    finished = threading.Event()
+    outcomes = []
+
+    def on_ready(error) -> None:
+        assert error is None
+        ready.set()
+
+    def on_csv_status(status: str) -> None:
+        statuses.append(status)
+        if "injected derived CSV failure" in status:
+            csv_failed.set()
+
+    class Adapter:
+        descriptor = ModelDescriptor(
+            "onnx-sleep-staging:fixture",
+            "sha256:fixture",
+            confidence_meaning="fixture probability",
+        )
+
+        def prepare(self, _cancel_event) -> None:
+            return None
+
+        def predict(self, _context, _block, _cancel_event):
+            return StagePrediction("N2", 0.5)
+
+        def close(self, _cancel_event) -> None:
+            return None
+
+    runtime = StimulationRuntime(
+        request_timeout_seconds=0.2,
+        rally_control_endpoint=fixture.endpoint,
+    )
+    pipeline = ProcessingPipeline(
+        session_id="csv-rally-stop",
+        host="127.0.0.1",
+        port=4455,
+        recording_enabled=True,
+        recording_root=tmp_path,
+        stage_csv_enabled=True,
+        pending_limit=16,
+        model_factory=Adapter,
+        on_ready=on_ready,
+        on_stimulation_result=lambda context, result: runtime.process_block(
+            context, result, generation=1
+        ),
+        on_stage_csv_status=on_csv_status,
+        on_finished=lambda outcome: (outcomes.append(outcome), finished.set()),
+    )
+    try:
+        runtime.configure(_real_config())
+        runtime.begin_session(
+            "csv-rally-stop", pipeline, True, generation=1, model_configured=True
+        )
+        runtime.set_session_ready(True)
+        assert runtime.set_control_mode("real")
+        assert runtime.set_automatic_enabled(True)
+        pipeline.start()
+        assert ready.wait(2.0)
+        context, _ = _result(1, "N2", session_id="csv-rally-stop")
+        assert pipeline.enqueue(context)
+        assert csv_failed.wait(2.0)
+        for block_id in range(2, 9):
+            context, _ = _result(block_id, "N2", session_id="csv-rally-stop")
+            assert pipeline.enqueue(context)
+        assert fixture.wait_for_count(1)
+        deadline = time.monotonic() + 1.0
+        while runtime.real_status["confirmed_state"] != "RUNNING":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        runtime.on_session_stopping("fixture session ended")
+        assert fixture.wait_for_count(2)
+        deadline = time.monotonic() + 1.0
+        while runtime.real_status["confirmed_state"] != "STOPPED":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        pipeline.handoff_network_end(None, cancelled=False, error=None)
+        pipeline.finish(cancelled=False, error=None)
+        assert finished.wait(3.0)
+
+        assert [payload for payload, _source in fixture.requests] == [
+            RALLY_START_COMMAND.encode("utf-8"),
+            RALLY_STOP_COMMAND.encode("utf-8"),
+        ]
+        assert outcomes[0].error is None
+        assert any("injected derived CSV failure" in status for status in statuses)
+        session_path = Path(outcomes[0].session_path)
+        reader = SessionReader(session_path)
+        assert len(reader.entries) == 8
+        assert [entry.processing_result["status"] for entry in reader.entries] == [
+            "success"
+        ] * 8
+        assert append_attempts == [1]
+        assert context_sizes_after_save == [(1, 1)] + [
+            (block_id, 0) for block_id in range(2, 9)
+        ]
+        assert writers and all(writer is writers[0] for writer in writers)
+        assert writers[0]._stage_csv_contexts == {}
+        phases = [event["payload"]["phase"] for event in reader.control_events]
+        assert "sent" in phases and "outcome" in phases
+        commands = [event["payload"]["command"] for event in reader.control_events]
+        assert RALLY_START_COMMAND in commands
+        assert RALLY_STOP_COMMAND in commands
+        manifest = json.loads((session_path / "manifest.json").read_text("utf-8"))
+        assert manifest["stage_csv"]["status"] == "failed"
+    finally:
+        runtime.shutdown()
+        assert runtime.join(1.0)
+        fixture.close()
+
+
 def test_rally_control_events_round_trip_without_eeg_blocks(tmp_path) -> None:
     writer = SessionWriter.create(
         tmp_path,

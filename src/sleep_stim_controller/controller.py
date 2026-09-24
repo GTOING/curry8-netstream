@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -25,7 +26,6 @@ from .staging import (
     PipelineOutcome,
     ProcessingPipeline,
     ProcessingResult,
-    utc_now_iso,
 )
 from .stimulation_runtime import StimulationRuntime
 from .validation import validate_data_block
@@ -67,12 +67,14 @@ class CurrySessionController(QObject):
     assembly_progress_changed = Signal(object)
     processing_changed = Signal(object)
     recording_changed = Signal(str)
+    stage_csv_changed = Signal(str)
 
     _pipeline_ready_signal = Signal(int, object)
     _network_finished_signal = Signal(int, bool, object)
     _pipeline_result_signal = Signal(int, object)
     _pipeline_fatal_signal = Signal(int, object)
     _pipeline_finished_signal = Signal(int, object)
+    _stage_csv_status_signal = Signal(int, str)
 
     def __init__(
         self,
@@ -81,6 +83,7 @@ class CurrySessionController(QObject):
         model_factory: Callable[[], ModelAdapter] = NoModelAdapter,
         pending_block_limit: int = DEFAULT_PENDING_BLOCK_LIMIT,
         stimulation_runtime: StimulationRuntime | None = None,
+        wall_clock: Callable[[], datetime] | None = None,
     ) -> None:
         super().__init__(parent)
         self._lock = threading.RLock()
@@ -93,6 +96,7 @@ class CurrySessionController(QObject):
         self._model_factory = model_factory
         self._pending_block_limit = pending_block_limit
         self._stimulation_runtime = stimulation_runtime
+        self._wall_clock = wall_clock or (lambda: datetime.now().astimezone())
         self._session: SessionInfo | None = None
         self._assembler: ThirtySecondEpochAssembler | None = None
         self._assembly_snapshot: EpochAssemblySnapshot | None = None
@@ -100,6 +104,8 @@ class CurrySessionController(QObject):
         self._session_id: str | None = None
         self._session_path: str | None = None
         self._recording_enabled = False
+        self._stage_csv_enabled = False
+        self._stage_csv_path: str | None = None
         self._latest = LatestItemBuffer[QueuedBlock]()
         self._accepted_blocks = 0
         self._validated_blocks = 0
@@ -125,6 +131,7 @@ class CurrySessionController(QObject):
         self._pipeline_result_signal.connect(self._on_processing_result)
         self._pipeline_fatal_signal.connect(self._on_pipeline_fatal)
         self._pipeline_finished_signal.connect(self._on_pipeline_finished)
+        self._stage_csv_status_signal.connect(self._on_stage_csv_status)
 
     @property
     def state(self) -> ConnectionState:
@@ -214,6 +221,7 @@ class CurrySessionController(QObject):
         *,
         recording_enabled: bool = False,
         recording_root: str | Path | None = None,
+        stage_csv_enabled: bool = False,
         model_factory: Callable[[], ModelAdapter] | None = None,
     ) -> bool:
         """Prepare the processing owner, then start networking off the GUI thread."""
@@ -233,6 +241,8 @@ class CurrySessionController(QObject):
                 raise ValueError("端口必须在 1–65535 范围内")
             if recording_enabled and not recording_root:
                 raise ValueError("启用记录前请先选择保存父目录")
+            if stage_csv_enabled and not recording_enabled:
+                raise ValueError("启用分期 CSV 前必须启用会话记录")
         except (TypeError, ValueError) as exc:
             self._set_error_state(str(exc))
             return False
@@ -241,6 +251,11 @@ class CurrySessionController(QObject):
             self._generation += 1
             generation = self._generation
             session_id = uuid.uuid4().hex
+            stage_csv_path = (
+                str(Path(recording_root).expanduser() / f"session_{session_id}" / "stage_labels.csv")
+                if stage_csv_enabled and recording_root is not None
+                else None
+            )
             cancel_event = threading.Event()
             client = CurryClient(
                 host,
@@ -259,6 +274,8 @@ class CurrySessionController(QObject):
             self._session_id = session_id
             self._session_path = None
             self._recording_enabled = recording_enabled
+            self._stage_csv_enabled = stage_csv_enabled
+            self._stage_csv_path = stage_csv_path
             self._accepted_blocks = 0
             self._validated_blocks = 0
             self._latest_processing = None
@@ -286,6 +303,7 @@ class CurrySessionController(QObject):
                 port=int(port),
                 recording_enabled=recording_enabled,
                 recording_root=recording_root,
+                stage_csv_enabled=stage_csv_enabled,
                 model_factory=effective_model_factory,
                 pending_limit=self._pending_block_limit,
                 on_ready=lambda error: self._pipeline_ready_signal.emit(
@@ -316,6 +334,9 @@ class CurrySessionController(QObject):
                 on_finished=lambda outcome: self._pipeline_finished_signal.emit(
                     generation, outcome
                 ),
+                on_stage_csv_status=lambda status: self._stage_csv_status_signal.emit(
+                    generation, status
+                ),
             )
             self._pipeline = pipeline
             if self._stimulation_runtime is not None:
@@ -338,6 +359,11 @@ class CurrySessionController(QObject):
         )
         self.recording_changed.emit(
             "正在创建新会话目录" if recording_enabled else "未保存（记录已关闭）"
+        )
+        self.stage_csv_changed.emit(
+            f"正在创建：{stage_csv_path}"
+            if stage_csv_enabled and stage_csv_path is not None
+            else "未启用"
         )
         self.diagnostics_changed.emit(
             "本次会话已创建。\n"
@@ -483,6 +509,13 @@ class CurrySessionController(QObject):
         self.state_changed.emit(ConnectionState.ERROR.value, "参数错误，未建立连接")
         self.error_changed.emit(text)
 
+    @Slot(int, str)
+    def _on_stage_csv_status(self, generation: int, status: str) -> None:
+        with self._lock:
+            if generation != self._generation:
+                return
+        self.stage_csv_changed.emit(status)
+
     @Slot(int, object)
     def _on_pipeline_ready(self, generation: int, error: BaseException | None) -> None:
         network_start_error: BaseException | None = None
@@ -493,6 +526,7 @@ class CurrySessionController(QObject):
             pipeline = self._pipeline
             client = self._client
             event = self._cancel_event
+            stage_csv_enabled = self._stage_csv_enabled
             if pipeline is not None and pipeline.session_path:
                 self._session_path = pipeline.session_path
                 if error is None:
@@ -504,6 +538,10 @@ class CurrySessionController(QObject):
             if error is not None:
                 self._network_done = True
                 self._network_error = error
+                if stage_csv_enabled:
+                    self.stage_csv_changed.emit(
+                        f"CSV/会话创建失败，采集未开始：{error}"
+                    )
             elif event is not None and event.is_set():
                 self._network_done = True
                 self._network_cancelled = True
@@ -674,7 +712,15 @@ class CurrySessionController(QObject):
         # Capture the packet-arrival boundary before validation, accumulation,
         # queueing or model work. All windows completed by this packet share
         # this timestamp, which is the last contributing packet for them.
-        received_utc = utc_now_iso()
+        received_at_local = self._wall_clock()
+        if received_at_local.tzinfo is None or received_at_local.utcoffset() is None:
+            raise ValueError("本机墙上时钟必须返回带 UTC 偏移的 datetime")
+        received_local_iso = received_at_local.isoformat(timespec="milliseconds")
+        received_utc = (
+            received_at_local.astimezone(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
         received_monotonic_ns = time.monotonic_ns()
         with self._lock:
             if generation != self._generation or (cancel_event and cancel_event.is_set()):
@@ -698,6 +744,7 @@ class CurrySessionController(QObject):
                     pipeline,
                     window,
                     received_utc,
+                    received_local_iso,
                     received_monotonic_ns,
                 )
         except ProcessingBacklogError:
@@ -718,6 +765,7 @@ class CurrySessionController(QObject):
         pipeline: ProcessingPipeline,
         block: DataBlock,
         received_utc: str,
+        received_local_iso: str,
         received_monotonic_ns: int,
     ) -> None:
         validate_data_block(block, session=session)
@@ -735,6 +783,7 @@ class CurrySessionController(QObject):
             block=block,
             received_utc=received_utc,
             received_monotonic_ns=received_monotonic_ns,
+            window_received_local_iso=received_local_iso,
         )
         if not pipeline.enqueue(context):
             error = ProcessingBacklogError(

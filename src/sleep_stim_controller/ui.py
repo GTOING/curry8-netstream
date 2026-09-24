@@ -101,6 +101,7 @@ class MainWindow(QMainWindow):
     replay_open_requested = Signal()
     replay_exit_requested = Signal()
     replay_index_requested = Signal(int)
+    replay_export_csv_requested = Signal()
     stimulation_configuration_changed = Signal(object)
     stimulation_auto_requested = Signal(bool)
     rally_mode_requested = Signal(str)
@@ -127,6 +128,8 @@ class MainWindow(QMainWindow):
         self._replay_mode = False
         self._replay_worker_busy = False
         self._replay_block_count = 0
+        self._replay_overview_ready = False
+        self._stage_csv_export_busy = False
         self._p3_background_busy = False
         self._p3_close_requested = False
         self._p3_auto_enabled = False
@@ -294,6 +297,16 @@ class MainWindow(QMainWindow):
         self.recording_checkbox.setObjectName("recordingEnabled")
         workflow_layout.addWidget(self.recording_status_label)
         workflow_layout.addWidget(self.recording_checkbox)
+        self.stage_csv_checkbox = QCheckBox("同时自动生成分期 CSV（默认关闭）")
+        self.stage_csv_checkbox.setObjectName("stageCsvEnabled")
+        self.stage_csv_checkbox.setEnabled(False)
+        self.recording_checkbox.toggled.connect(self._on_recording_toggled)
+        self.stage_csv_checkbox.toggled.connect(self._on_stage_csv_toggled)
+        workflow_layout.addWidget(self.stage_csv_checkbox)
+        self.stage_csv_status_label = QLabel("分期 CSV：未启用")
+        self.stage_csv_status_label.setObjectName("stageCsvStatus")
+        self.stage_csv_status_label.setWordWrap(True)
+        workflow_layout.addWidget(self.stage_csv_status_label)
         choose_path = QHBoxLayout()
         self.choose_recording_dir_button = QPushButton("选择保存目录…")
         self.choose_recording_dir_button.setObjectName("chooseRecordingDirectory")
@@ -311,8 +324,13 @@ class MainWindow(QMainWindow):
         self.exit_replay_button = QPushButton("退出回放")
         self.exit_replay_button.setObjectName("exitReplay")
         self.exit_replay_button.clicked.connect(self.replay_exit_requested)
+        self.export_stage_csv_button = QPushButton("导出/重新生成 CSV")
+        self.export_stage_csv_button.setObjectName("exportStageCsv")
+        self.export_stage_csv_button.setEnabled(False)
+        self.export_stage_csv_button.clicked.connect(self.replay_export_csv_requested)
         replay_actions.addWidget(self.open_replay_button)
         replay_actions.addWidget(self.exit_replay_button)
+        replay_actions.addWidget(self.export_stage_csv_button)
         workflow_layout.addLayout(replay_actions)
 
         navigation = QHBoxLayout()
@@ -586,7 +604,7 @@ class MainWindow(QMainWindow):
             label.setMinimumWidth(0)
         for label in (self.data_status_label, self.block_metadata_label,
                       self.assembly_progress_label, self.processing_status_label,
-                      self.recording_root_label,
+                      self.recording_root_label, self.stage_csv_status_label,
                       self.protocol_summary_label, self.stimulation_recent_label,
                       self.error_label, self.session_id_label, self.replay_status_label):
             label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -602,6 +620,7 @@ class MainWindow(QMainWindow):
             "port": self.port_spin.value(),
             "recording_enabled": self.recording_checkbox.isChecked(),
             "recording_root": self._recording_root,
+            "stage_csv_enabled": self.stage_csv_checkbox.isChecked(),
         }
 
     def model_configuration(self) -> dict[str, str]:
@@ -1089,9 +1108,40 @@ class MainWindow(QMainWindow):
         self.recording_root_label.setProperty("path", path)
         self.recording_root_label.setText(path)
 
+    @Slot(bool)
+    def _on_recording_toggled(self, enabled: bool) -> None:
+        if not enabled and self.stage_csv_checkbox.isChecked():
+            self.stage_csv_checkbox.setChecked(False)
+        self.stage_csv_checkbox.setEnabled(
+            enabled and not self._busy and not self._replay_mode
+        )
+        if not enabled:
+            self.stage_csv_status_label.setText("分期 CSV：未启用")
+        elif self.stage_csv_checkbox.isChecked():
+            self.stage_csv_status_label.setText(
+                "分期 CSV：已选择；连接后写入本次新会话的 stage_labels.csv"
+            )
+
+    @Slot(bool)
+    def _on_stage_csv_toggled(self, enabled: bool) -> None:
+        if enabled:
+            self.stage_csv_status_label.setText(
+                "分期 CSV：已选择；连接后写入本次新会话的 stage_labels.csv"
+            )
+        elif not self._replay_mode:
+            self.stage_csv_status_label.setText("分期 CSV：未启用")
+
     @Slot(str)
     def set_recording_status(self, text: str) -> None:
         self.recording_status_label.setText("保存状态：" + text)
+
+    @Slot(str)
+    def set_stage_csv_status(self, text: str) -> None:
+        self.stage_csv_status_label.setText("分期 CSV：" + text)
+
+    def set_stage_csv_export_busy(self, busy: bool) -> None:
+        self._stage_csv_export_busy = busy
+        self._update_button_state()
 
     def _format_processing_result(self, result) -> str:
         if result is None:
@@ -1187,6 +1237,9 @@ class MainWindow(QMainWindow):
         self.model_enabled_checkbox.setEnabled(not busy and not self._replay_mode)
         self._update_model_controls()
         self.recording_checkbox.setEnabled(not busy and not self._replay_mode)
+        self.stage_csv_checkbox.setEnabled(
+            self.recording_checkbox.isChecked() and not busy and not self._replay_mode
+        )
         self.choose_recording_dir_button.setEnabled(not busy and not self._replay_mode)
         self._update_button_state()
         self._maybe_finish_pending_close()
@@ -1204,6 +1257,11 @@ class MainWindow(QMainWindow):
             not self._busy and not self._replay_mode and not self._replay_worker_busy
         )
         self.exit_replay_button.setEnabled(self._replay_mode and self._replay_worker_busy)
+        self.export_stage_csv_button.setEnabled(
+            self._replay_mode
+            and self._replay_overview_ready
+            and not self._stage_csv_export_busy
+        )
 
     def set_replay_worker_busy(self, busy: bool) -> None:
         self._replay_worker_busy = busy
@@ -1233,10 +1291,15 @@ class MainWindow(QMainWindow):
         self.model_enabled_checkbox.setEnabled(not active and not self._busy)
         self._update_model_controls()
         self.recording_checkbox.setEnabled(not active and not self._busy)
+        self.stage_csv_checkbox.setEnabled(
+            not active and not self._busy and self.recording_checkbox.isChecked()
+        )
         self.choose_recording_dir_button.setEnabled(not active and not self._busy)
         self._update_stimulation_controls()
 
         if entering:
+            self._replay_overview_ready = False
+            self._stage_csv_export_busy = False
             self.mode_label.setText("离线回放 · 加载中")
             self.session_id_label.setText("回放会话：加载中")
             self._last_block_summary = "尚无回放块"
@@ -1256,6 +1319,7 @@ class MainWindow(QMainWindow):
             self.data_status_label.setText("数据状态：正在打开离线回放")
             self.processing_status_label.setText("离线回放：等待已记录分期结果")
         if not active:
+            self._replay_overview_ready = False
             self._handshake_ready = False
             self.mode_label.setText("历史离线回放" if self._has_displayed_block else "实时 · 未连接")
             if not self._has_displayed_block:
@@ -1290,6 +1354,7 @@ class MainWindow(QMainWindow):
         self.model_channel_edit.setEnabled(enabled)
 
     def set_replay_ready(self, overview) -> None:
+        self._replay_overview_ready = True
         self.session_id_label.setText(f"回放会话：{overview.session_id}")
         self._replay_block_count = overview.block_count
         if not overview.block_count:
