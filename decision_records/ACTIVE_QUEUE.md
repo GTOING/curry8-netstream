@@ -1,12 +1,14 @@
 # 当前任务队列
 
-更新：2026-09-23。当前角色：决策主线程。
+更新：2026-09-24。当前角色：决策主线程。
 
 ## 当前目标与状态
 
-2026-09-23 当前权威状态：P4-B 已通过 PR #4 合并；Issue 5 与 Issue 6 工程范围均已通过主线程验收。用户已授权将这两项实现和证据提交推送至正式 `main`。以下早期“未提交/待实现”等叙述是当时的历史状态。
+2026-09-24 当前权威状态：P4-B 已通过 PR #4 合并；Issue 5 与 Issue 6 工程范围通过验收并发布于 `main@cf88643`；Issue 7 工程范围通过验收并发布于 `main@98c4100`，三个远端 issue 均以 completed 关闭。Issue 8 尚待实施。以下早期“未提交/待实现”等叙述是当时的历史状态。
 
-- 已获取远端全部两个 open issue（#5、#6），均无评论，归档见 [Issue 快照](../reports/remote_issues/2026-09-22/issue-5.md) 及 [#6](../reports/remote_issues/2026-09-22/issue-6.md)。
+- 远端 [Issue #5](https://github.com/GTOING/curry8-netstream/issues/5) 与 [Issue #6](https://github.com/GTOING/curry8-netstream/issues/6) 已于 2026-09-24 以 completed 关闭；获取时均无评论，原始状态归档见 [Issue 快照](../reports/remote_issues/2026-09-22/issue-5.md) 及 [#6](../reports/remote_issues/2026-09-22/issue-6.md)。
+- 远端 [Issue #7：会话分期 CSV 自动续写与本机时间](https://github.com/GTOING/curry8-netstream/issues/7) 已于 2026-09-24 以 completed 关闭；两项收口通过[主线程工程验收](../reports/ISSUE7_SESSION_CSV_ACCEPTANCE.md)，实现与证据已提交推送。执行者最终定向 5 passed、完整回归 246 passed；主线程未重跑全量。Windows/Excel 与真实设备验证未执行；CSV 是会话 JSONL/NPY 的可选派生表，本机接收时间不代表 EEG 精确采集时刻。
+- 远端 [Issue #8：GUI 滚轮防误触](https://github.com/GTOING/curry8-netstream/issues/8) 已于 2026-09-24 提交，当前为 open，尚未实现。选项与数值控件的滚轮不得改值，设置区与只读内容仍应正常滚动。
 - Issue 5 工程范围收口验收通过（2026-09-23）：启用零基线 Stop、实际 Start 发送责任、取消锁顺序及重新启用旧结果边界已复核。执行者最终完整回归 210 passed，主线程未重跑；详见 [验收记录末节](../reports/ISSUE5_RALLY_ARMING_ACCEPTANCE.md) 与 [执行报告](../reports/ISSUE5_RALLY_ARMING_FIX_REPORT.md)。真实 Rally/Windows 物理验收仍待完成。
 - Issue 6 工程范围收口验收通过（2026-09-23）：一般未发送 Start/Apply 不再自动重排，只有新合格期别明确取代旧 Apply 才在资格复核后规划最新协议；容量、发送异常与 SD 到期均有限收尾。执行者最终定向 38 passed、完整 237 passed；主线程按代码与关键测试复核，未重跑全量。见[验收记录末节](../reports/ISSUE6_PARADIGM_ACCEPTANCE.md)、[执行报告](../reports/ISSUE6_PARADIGM_IMPLEMENTATION_REPORT.md)和[工程合同](../docs/ISSUE6_PARADIGM_CONTRACT.md)。前次 231 passed 与暂不通过描述为历史；旧[草案](../docs/tasks/ISSUE6_PARADIGM_EXTENSION_DRAFT.md)仅作历史。
 - Issue 5+6 实现、测试、合同与事实报告纳入本次发布；本地测试留下的 `:memory:.ses` 不纳入版本控制。无生产范式包或批准的 A/B/C 参数；Windows/真实 Rally/物理输出验收不由合成证据替代。
