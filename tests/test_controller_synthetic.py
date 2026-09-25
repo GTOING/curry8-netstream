@@ -2043,6 +2043,16 @@ def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
     window.show()
     server = None
     try:
+        window.open_connection_settings_button.click()
+        qapp.processEvents()
+        assert window.pages.currentWidget() is window.diagnostics_scroll
+        assert rally.requests == []
+        for page in range(window.pages.count()):
+            window.pages.setCurrentIndex(page)
+            qapp.processEvents()
+        window.setStyleSheet(window.styleSheet())
+        qapp.processEvents()
+        assert rally.requests == []
         window.set_recording_root(str(tmp_path))
         window.recording_checkbox.setChecked(True)
         window.rally_mode_combo.setCurrentIndex(1)
@@ -2058,6 +2068,10 @@ def test_p4b_curry_tcp_staging_fake_rally_gui_and_recording_closeout(
         window.port_spin.setValue(server.port)
         window.connect_button.click()
         assert wait_until(qapp, lambda: controller.state is ConnectionState.STREAMING)
+        for page in range(window.pages.count()):
+            window.pages.setCurrentIndex(page)
+            qapp.processEvents()
+        assert rally.requests == []
         window.real_control_confirm_checkbox.setChecked(True)
         window.stimulation_auto_checkbox.setChecked(True)
         server.release_stream.set()

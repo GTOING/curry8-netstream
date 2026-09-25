@@ -10,7 +10,8 @@
 ## 有效合同与计划
 
 - [Issue 5 启用与停止证据合同](../docs/ISSUE5_RALLY_ARMING_CONTRACT.md)：工程实现已于 2026-09-23 通过主线程验收。
-- [Issue 6 多协议范式工程合同](../docs/ISSUE6_PARADIGM_CONTRACT.md)：2026-09-23 发布，待实现；实际实验参数尚未冻结。
+- [Issue 6 多协议范式工程合同](../docs/ISSUE6_PARADIGM_CONTRACT.md)：工程实现已于 2026-09-23 通过主线程验收；实际实验参数尚未冻结。
+- [现代化 GUI 调研与设计](../docs/P_GUI_MODERNIZATION_DESIGN.md)：2026-09-25 发布；[实施计划](plans/P_GUI_MODERNIZATION_PLAN.md)、[feature 分支执行任务](../docs/tasks/P_GUI_MODERNIZATION_EXECUTION.md)与[局部收口](../docs/tasks/P_GUI_MODERNIZATION_CLOSEOUT.md)已完成；[主线程验收记录末节](../reports/P_GUI_MODERNIZATION_ACCEPTANCE.md)判定工程范围通过，Windows 原生仍待验证。实现未提交、推送或合并。
 
 - [睡眠分期电刺激控制器需求整理](../docs/SLEEP_STIM_REQUIREMENTS.md)：记录用户已明确目标与待定项，尚未冻结详细接口、刺激参数或同步合同。
 - [开发流程规划](plans/SLEEP_STIM_DEVELOPMENT_PLAN.md)：分阶段范围、依赖与验收；P1 工程验收通过，P2 工程验收通过，P3 模拟工程验收通过，P4-A 诊断/文档已验收，原生桌面验证待完成，真机/同步后续批次未发布。

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QTabWidget,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -255,6 +256,8 @@ class MainWindow(QMainWindow):
         self._p3_recent: list[str] = []
         self._rally_mode = "simulation"
         self._rally_profile = "binary"
+        self._rally_runtime_state = "DISARMED/UNKNOWN"
+        self._replay_completeness = "加载中"
         self._paradigm_package_summary = "未选择范式包；范式模式默认关闭"
 
         toolbar = QToolBar("程序信息")
@@ -270,11 +273,13 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(12, 8, 12, 6)
 
         operator = QWidget()
         root_layout.addWidget(operator)
         operator_layout = QVBoxLayout(operator)
         operator_layout.setContentsMargins(0, 0, 0, 0)
+        operator_layout.setSpacing(7)
         self.mode_label = QLabel("实时 · 等待连接")
 
         self.state_label = QLabel("状态：未连接")
@@ -290,11 +295,45 @@ class MainWindow(QMainWindow):
         self.disconnect_button = QPushButton("断开")
         self.disconnect_button.setObjectName("disconnectButton")
         self.disconnect_button.clicked.connect(self.disconnect_requested)
-        self.connect_button.setFixedWidth(100)
-        self.disconnect_button.setFixedWidth(100)
+        self.connect_button.setMinimumWidth(76)
+        self.disconnect_button.setMinimumWidth(76)
         controls.addWidget(self.connect_button)
         controls.addWidget(self.disconnect_button)
         operator_layout.addLayout(controls)
+
+        self.run_bar = QFrame()
+        self.run_bar.setObjectName("runBar")
+        run_grid = QGridLayout(self.run_bar)
+        run_grid.setContentsMargins(10, 7, 10, 7)
+        run_grid.setHorizontalSpacing(14)
+        run_grid.setVerticalSpacing(4)
+        self.run_progress_label = QLabel("30 秒窗口：等待连接 · 0.0 / 30 秒")
+        self.run_model_label = QLabel("模型：NoModel · 无期别")
+        self.run_recording_label = QLabel("记录：关 · CSV：关")
+        self.run_control_label = QLabel("自动控制：关 · 本机模拟")
+        self.run_api_label = QLabel("API 最近确认：无\n物理输出未验证")
+        self.disable_automatic_button = QPushButton("关闭自动控制")
+        self.disable_automatic_button.setObjectName("disableAutomatic")
+        self.disable_automatic_button.setAccessibleName("关闭自动控制；不是硬件急停")
+        self.disable_automatic_button.setToolTip("调用现有自动控制停用路径；不是硬件急停")
+        self.disable_automatic_button.setEnabled(False)
+        for index, label in enumerate((
+            self.run_progress_label, self.run_model_label, self.run_recording_label,
+            self.run_control_label, self.run_api_label,
+        )):
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            run_grid.addWidget(label, index // 3, index % 3)
+        run_grid.addWidget(self.disable_automatic_button, 1, 2)
+        for column in range(3):
+            run_grid.setColumnStretch(column, 1)
+        operator_layout.addWidget(self.run_bar)
+
+        self.stop_warning_label = QLabel()
+        self.stop_warning_label.setObjectName("stopWarning")
+        self.stop_warning_label.setWordWrap(True)
+        self.stop_warning_label.hide()
+        operator_layout.addWidget(self.stop_warning_label)
 
         self.data_status_label = QLabel(
             "数据状态：等待连接；EEG 波形请在 Curry 8 查看。"
@@ -326,8 +365,7 @@ class MainWindow(QMainWindow):
 
 
         self.hint_label = QLabel(
-            "模型默认关闭（NoModel）；ONNX 睡眠分期可在连接前显式启用 · "
-            "仅模拟，真实刺激未接入 · EEG 波形请在 Curry 8 查看"
+            "API 回复不证明物理输出；EEG 波形请在 Curry 8 查看。"
         )
         self.hint_label.setWordWrap(True)
         self.hint_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -347,28 +385,98 @@ class MainWindow(QMainWindow):
         self.error_scroll.hide()
         operator_layout.addWidget(self.error_scroll)
 
-        # Only settings and diagnostics scroll; state and errors stay visible.
+        # Each page scrolls independently; run state and errors stay outside tabs.
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setObjectName("settingsScroll")
-        self.settings_scroll.setWidgetResizable(True)
-        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        settings = QWidget()
-        settings_layout = QVBoxLayout(settings)
-        settings_layout.setContentsMargins(2, 2, 12, 12)
-        settings_layout.setSpacing(14)
-        self.summary_section = QGroupBox("数据与分期摘要")
+        self.overview_scroll = QScrollArea()
+        self.workflow_scroll = QScrollArea()
+        self.diagnostics_scroll = QScrollArea()
+        self.pages = QTabWidget()
+        self.pages.setObjectName("controlPages")
+        page_layouts = []
+        for scroll, name, title in (
+            (self.overview_scroll, "overviewScroll", "运行总览"),
+            (self.settings_scroll, "settingsScroll", "刺激控制"),
+            (self.workflow_scroll, "workflowScroll", "记录与回放"),
+            (self.diagnostics_scroll, "diagnosticsScroll", "连接／模型／诊断"),
+        ):
+            scroll.setObjectName(name)
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(8, 8, 12, 12)
+            layout.setSpacing(12)
+            scroll.setWidget(page)
+            self.pages.addTab(scroll, title)
+            page_layouts.append(layout)
+        overview_layout, settings_layout, workflow_page_layout, diagnostics_layout = page_layouts
+        operator_layout.addWidget(self.pages, 1)
+
+        self.overview_empty = QFrame()
+        self.overview_empty.setObjectName("overviewEmpty")
+        empty_layout = QVBoxLayout(self.overview_empty)
+        empty_layout.setContentsMargins(28, 18, 28, 18)
+        empty_layout.setSpacing(12)
+        empty_layout.addStretch()
+        self.overview_empty_title = QLabel("尚无实时会话")
+        self.overview_empty_title.setObjectName("overviewEmptyTitle")
+        empty_layout.addWidget(self.overview_empty_title)
+        self.overview_empty_detail = QLabel(
+            "先核对 Curry 地址与端口，按需选择 ONNX 模型。连接后，这里显示真实的 30 秒窗口和分期结果。"
+        )
+        empty_layout.addWidget(self.overview_empty_detail)
+        self.open_connection_settings_button = QPushButton("检查连接与模型设置")
+        self.open_connection_settings_button.setObjectName("openConnectionSettings")
+        self.open_connection_settings_button.setAccessibleName("切到连接、模型与诊断页；不发起连接")
+        self.open_connection_settings_button.clicked.connect(
+            lambda: self.pages.setCurrentWidget(self.diagnostics_scroll)
+        )
+        empty_layout.addWidget(self.open_connection_settings_button, 0, Qt.AlignmentFlag.AlignLeft)
+        empty_layout.addStretch()
+        overview_layout.addWidget(self.overview_empty, 1)
+
+        self.overview_hero = QFrame()
+        self.overview_hero.setObjectName("overviewHero")
+        hero_layout = QGridLayout(self.overview_hero)
+        hero_layout.setContentsMargins(16, 13, 16, 13)
+        hero_layout.setHorizontalSpacing(22)
+        hero_layout.addWidget(QLabel("当前 30 秒窗口"), 0, 0)
+        hero_layout.addWidget(QLabel("最新真实分期"), 0, 1)
+        self.overview_progress_primary = QLabel("等待连接")
+        self.overview_progress_primary.setObjectName("overviewPrimary")
+        self.overview_stage_primary = QLabel("无期别")
+        self.overview_stage_primary.setObjectName("overviewPrimary")
+        hero_layout.addWidget(self.overview_progress_primary, 1, 0)
+        hero_layout.addWidget(self.overview_stage_primary, 1, 1)
+        self.overview_progress_detail = QLabel("0.0 / 30 秒；尚无完整窗口")
+        self.overview_stage_reason = QLabel("模型默认未启用（NoModel）")
+        hero_layout.addWidget(self.overview_progress_detail, 2, 0)
+        hero_layout.addWidget(self.overview_stage_reason, 2, 1)
+        hero_layout.setColumnStretch(0, 1)
+        hero_layout.setColumnStretch(1, 1)
+        overview_layout.addWidget(self.overview_hero)
+
+        self.summary_section = QGroupBox("会话与处理详情")
         self.summary_section.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         summary_layout = QGridLayout(self.summary_section)
         summary_layout.setVerticalSpacing(4)
         self.session_id_label = QLabel("当前会话：尚未连接")
         summary_layout.addWidget(self.session_id_label, 0, 0, 1, 2)
-        summary_layout.addWidget(self.data_status_label, 1, 0)
-        summary_layout.addWidget(self.processing_status_label, 1, 1)
+        summary_layout.addWidget(self.data_status_label, 1, 0, 1, 2)
         summary_layout.addWidget(self.block_metadata_label, 2, 0, 1, 2)
         summary_layout.addWidget(self.assembly_progress_label, 3, 0, 1, 2)
+        summary_layout.addWidget(self.processing_status_label, 4, 0, 1, 2)
+        self.target_summary_label = QLabel("目标期：未选择（W/N1/N2/N3/REM 均未勾选）")
+        self.target_summary_label.setObjectName("targetStagesSummary")
+        self.overview_control_label = QLabel("控制期望：无 · Rally API 最近确认：未知")
+        self.overview_control_label.setObjectName("overviewControlState")
+        summary_layout.addWidget(self.target_summary_label, 5, 0, 1, 2)
+        summary_layout.addWidget(self.overview_control_label, 6, 0, 1, 2)
         summary_layout.setColumnStretch(0, 1)
         summary_layout.setColumnStretch(1, 1)
-        settings_layout.addWidget(self.summary_section)
+        overview_layout.addWidget(self.summary_section)
 
         self.model_section = CollapsibleSection("睡眠分期模型")
         model_layout = QFormLayout(self.model_section.content)
@@ -382,6 +490,7 @@ class MainWindow(QMainWindow):
         self.model_path_edit = QLineEdit()
         self.model_path_edit.setObjectName("modelPathEdit")
         self.model_path_edit.setPlaceholderText("启用后显式选择一个 ONNX 模型文件")
+        self.model_path_edit.textChanged.connect(self._refresh_preconnect_model_summary)
         self.choose_model_button = QPushButton("选择…")
         self.choose_model_button.setObjectName("chooseOnnxModel")
         self.choose_model_button.clicked.connect(self._choose_model_path)
@@ -402,11 +511,17 @@ class MainWindow(QMainWindow):
         )
         self.model_contract_label.setWordWrap(True)
         model_layout.addRow("固定预处理", self.model_contract_label)
-        settings_layout.addWidget(self.model_section)
+        diagnostics_layout.addWidget(self.model_section)
 
         self.workflow_section = CollapsibleSection("会话记录与离线回放")
         workflow_layout = QVBoxLayout(self.workflow_section.content)
         workflow_layout.setContentsMargins(4, 4, 4, 4)
+        self.replay_readonly_label = QLabel(
+            "离线回放仅展示已记录内容；不会连接 Rally、运行决策或发送命令。"
+        )
+        self.replay_readonly_label.setObjectName("replayReadonly")
+        self.replay_readonly_label.setWordWrap(True)
+        workflow_layout.addWidget(self.replay_readonly_label)
         self.recording_checkbox = QCheckBox("启用本次会话记录（默认关闭）")
         self.recording_checkbox.setObjectName("recordingEnabled")
         workflow_layout.addWidget(self.recording_status_label)
@@ -488,8 +603,8 @@ class MainWindow(QMainWindow):
         stimulation_layout = QVBoxLayout(self.stimulation_section.content)
         stimulation_layout.setContentsMargins(4, 4, 4, 4)
         self.stimulation_warning_label = QLabel(
-            "仅模拟，真实刺激未接入（当前默认状态）。真实模式只控制 Rally 已加载协议，"
-            "不选择或修改刺激参数。"
+            "本机模拟：真实 Rally 不会收到请求。真实模式只控制 Rally 已加载协议，"
+            "不选择或修改刺激参数；API 确认不等于物理输出确认。"
         )
         self.stimulation_warning_label.setWordWrap(True)
         self.stimulation_warning_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -510,7 +625,9 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self.rally_mode_combo, 1)
         stimulation_layout.addLayout(mode_row)
 
-        profile_row = QHBoxLayout()
+        self.profile_row_widget = QWidget()
+        profile_row = QHBoxLayout(self.profile_row_widget)
+        profile_row.setContentsMargins(0, 0, 0, 0)
         self.rally_profile_combo = QComboBox()
         self.rally_profile_combo.setObjectName("rallyProtocolProfile")
         self.rally_profile_combo.addItem("二值启停（现有协议）", "binary")
@@ -518,9 +635,11 @@ class MainWindow(QMainWindow):
         self.rally_profile_combo.currentIndexChanged.connect(self._request_rally_profile)
         profile_row.addWidget(QLabel("真实协议配置"))
         profile_row.addWidget(self.rally_profile_combo, 1)
-        stimulation_layout.addLayout(profile_row)
+        stimulation_layout.addWidget(self.profile_row_widget)
 
-        paradigm_row = QHBoxLayout()
+        self.paradigm_row_widget = QWidget()
+        paradigm_row = QHBoxLayout(self.paradigm_row_widget)
+        paradigm_row.setContentsMargins(0, 0, 0, 0)
         self.choose_paradigm_button = QPushButton("选择范式包目录…")
         self.choose_paradigm_button.setObjectName("chooseParadigmPackage")
         self.choose_paradigm_button.clicked.connect(self._choose_paradigm_package)
@@ -528,7 +647,7 @@ class MainWindow(QMainWindow):
         self.paradigm_package_summary_label.setObjectName("paradigmPackageSummary")
         paradigm_row.addWidget(self.choose_paradigm_button)
         paradigm_row.addWidget(self.paradigm_package_summary_label, 1)
-        stimulation_layout.addLayout(paradigm_row)
+        stimulation_layout.addWidget(self.paradigm_row_widget)
 
         self.rally_mode_hint_label = QLabel(
             "真实模式要求操作者先在 Rally 中加载并检查协议；软件确认只表示收到 API 回复。"
@@ -539,17 +658,17 @@ class MainWindow(QMainWindow):
 
         stage_row = QHBoxLayout()
         self.stage_checkboxes: dict[str, QCheckBox] = {}
+        stimulation_layout.addWidget(QLabel("目标睡眠期 · 默认不选择"))
         for stage in STAGES:
             checkbox = QCheckBox(stage)
             checkbox.setObjectName(f"stimTarget{stage}")
             checkbox.toggled.connect(self._request_stimulation_configuration)
+            checkbox.toggled.connect(self._refresh_target_summary)
             self.stage_checkboxes[stage] = checkbox
             stage_row.addWidget(checkbox)
         stimulation_layout.addLayout(stage_row)
 
-        stimulation_form = QGridLayout()
-        stimulation_form.setColumnStretch(1, 1)
-        stimulation_form.setColumnStretch(3, 1)
+        stimulation_form = QFormLayout()
         self.stimulation_strategy_combo = QComboBox()
         self.stimulation_strategy_combo.setObjectName("stimulationStrategy")
         self.stimulation_strategy_combo.addItem("未选择策略", None)
@@ -562,8 +681,7 @@ class MainWindow(QMainWindow):
         self.stimulation_strategy_combo.currentIndexChanged.connect(
             self._request_stimulation_configuration
         )
-        stimulation_form.addWidget(QLabel("触发策略"), 0, 0)
-        stimulation_form.addWidget(self.stimulation_strategy_combo, 0, 1)
+        stimulation_form.addRow("触发策略", self.stimulation_strategy_combo)
 
         self.min_interval_edit = QLineEdit()
         self.min_interval_edit.setObjectName("stimulationMinInterval")
@@ -571,8 +689,7 @@ class MainWindow(QMainWindow):
         self.min_interval_edit.editingFinished.connect(
             self._request_stimulation_configuration
         )
-        stimulation_form.addWidget(QLabel("最小请求间隔（秒）"), 0, 2)
-        stimulation_form.addWidget(self.min_interval_edit, 0, 3)
+        stimulation_form.addRow("最小请求间隔（秒）", self.min_interval_edit)
 
         self.max_result_age_edit = QLineEdit()
         self.max_result_age_edit.setObjectName("stimulationMaxResultAge")
@@ -580,8 +697,7 @@ class MainWindow(QMainWindow):
         self.max_result_age_edit.editingFinished.connect(
             self._request_stimulation_configuration
         )
-        stimulation_form.addWidget(QLabel("最大结果年龄（秒）"), 1, 0)
-        stimulation_form.addWidget(self.max_result_age_edit, 1, 1)
+        stimulation_form.addRow("最大结果年龄（秒）", self.max_result_age_edit)
 
         self.request_timeout_edit = QLineEdit("1.0")
         self.request_timeout_edit.setObjectName("simulatedRequestTimeout")
@@ -589,8 +705,8 @@ class MainWindow(QMainWindow):
         self.request_timeout_edit.editingFinished.connect(
             self._request_timeout_update
         )
-        stimulation_form.addWidget(QLabel("模拟通信超时（秒）"), 1, 2)
-        stimulation_form.addWidget(self.request_timeout_edit, 1, 3)
+        stimulation_form.addRow("模拟通信超时（秒）", self.request_timeout_edit)
+        self.request_timeout_label = stimulation_form.labelForField(self.request_timeout_edit)
         stimulation_layout.addLayout(stimulation_form)
 
         scheme_row = QHBoxLayout()
@@ -627,6 +743,9 @@ class MainWindow(QMainWindow):
         self.stimulation_auto_checkbox.toggled.connect(
             self._request_automatic_decision
         )
+        self.disable_automatic_button.clicked.connect(
+            lambda: self.stimulation_auto_checkbox.setChecked(False)
+        )
         stimulation_layout.addWidget(self.stimulation_auto_checkbox)
         self.real_control_confirm_checkbox = QCheckBox(
             "我确认 Rally 已加载并检查协议，且当前未进行刺激；启用真实自动控制"
@@ -655,10 +774,12 @@ class MainWindow(QMainWindow):
         self.stimulation_recent_label.setObjectName("stimulationRecentEvents")
         self.stimulation_recent_label.setTextFormat(Qt.TextFormat.PlainText)
         self.stimulation_recent_label.setWordWrap(True)
-        stimulation_layout.addWidget(self.stimulation_recent_label)
+        overview_layout.addWidget(self.stimulation_recent_label)
         settings_layout.addWidget(self.stimulation_section)
-        settings_layout.addWidget(self.workflow_section)
+        workflow_page_layout.addWidget(self.workflow_section)
         self.stimulation_section.set_expanded(True)
+        settings_layout.addStretch()
+        workflow_page_layout.addStretch()
 
         connection = CollapsibleSection("Curry 连接")
         connection_form = QFormLayout(connection.content)
@@ -671,9 +792,10 @@ class MainWindow(QMainWindow):
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(4455)
         connection_form.addRow("端口", self.port_spin)
-        settings_layout.addWidget(connection)
+        diagnostics_layout.addWidget(connection)
         self.connection_section = connection
-        connection.set_expanded(False)
+        connection.set_expanded(True)
+        self.model_section.set_expanded(True)
 
         self.session_section = CollapsibleSection("会话元信息")
         session_layout = QVBoxLayout(self.session_section.content)
@@ -683,7 +805,7 @@ class MainWindow(QMainWindow):
         self.session_info.setMinimumHeight(110)
         self.session_info.setPlaceholderText("完成 BasicInfo 和 ChannelInfo 握手后显示")
         session_layout.addWidget(self.session_info)
-        settings_layout.addWidget(self.session_section)
+        diagnostics_layout.addWidget(self.session_section)
 
         self.diagnostics_section = CollapsibleSection("诊断详情")
         diagnostic_layout = QVBoxLayout(self.diagnostics_section.content)
@@ -693,35 +815,62 @@ class MainWindow(QMainWindow):
         self.details.setMinimumHeight(150)
         self.details.setPlaceholderText("连接、块校验和有界显示交接信息")
         diagnostic_layout.addWidget(self.details)
-        settings_layout.addWidget(self.diagnostics_section)
-        settings_layout.addStretch()
-        self.settings_scroll.setWidget(settings)
-        operator_layout.addWidget(self.settings_scroll, 1)
+        diagnostics_layout.addWidget(self.diagnostics_section)
+        diagnostics_layout.addStretch()
         self._wheel_scroll_guard = _WheelScrollGuard(
             self.settings_scroll,
             (
                 self.rally_mode_combo,
                 self.rally_profile_combo,
                 self.stimulation_strategy_combo,
-                self.port_spin,
-                self.replay_index_spin,
             ),
             scrollable_contents=((self.error_label, self.error_scroll),),
             parent=self,
         )
+        self._diagnostics_wheel_scroll_guard = _WheelScrollGuard(
+            self.diagnostics_scroll, (self.port_spin,), parent=self,
+        )
+        self._workflow_wheel_scroll_guard = _WheelScrollGuard(
+            self.workflow_scroll, (self.replay_index_spin,), parent=self,
+        )
 
         self.setStyleSheet("""
-            QMainWindow { background: #f3f5f7; }
+            QMainWindow { background: #f7f9fb; }
             QWidget { font-size: 13px; color: #223142; }
-            QGroupBox { font-weight: 600; border: 1px solid #d7dee5;
-                        border-radius: 6px; margin-top: 10px; padding: 14px 10px 8px; }
+            QFrame#runBar { background: #eaf1f3; border: 1px solid #c8d9dd;
+                            border-radius: 5px; }
+            QFrame#overviewEmpty { background: #f1f6f7; border-left: 3px solid #116676; }
+            QFrame#overviewHero { background: #f1f6f7; border-left: 3px solid #116676; }
+            QLabel#overviewEmptyTitle { font-size: 21px; font-weight: 700; }
+            QLabel#overviewPrimary { font-size: 22px; font-weight: 700; }
+            QLabel#stopWarning { background: #fff0ed; color: #a02723;
+                                 border: 1px solid #d9948d; padding: 6px;
+                                 font-weight: 700; }
+            QTabWidget#controlPages::pane { border: 1px solid #d5dfe5;
+                                            background: #ffffff; }
+            QTabBar::tab { background: #e9eef1; padding: 8px 14px;
+                           border: 1px solid #d5dfe5; }
+            QTabBar::tab:selected { background: #ffffff; color: #116676;
+                                    border-bottom-color: #ffffff; font-weight: 700; }
+            QTabBar::tab:focus { border: 2px solid #116676; }
+            QGroupBox { font-weight: 600; border: 1px solid #d5dfe5;
+                        border-radius: 4px; margin-top: 10px; padding: 14px 10px 8px; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; }
-            QPushButton, QLineEdit, QComboBox, QSpinBox { min-height: 26px; }
-            QToolButton { font-weight: 600; padding: 5px 0; }
-            QPushButton#connectButton { background: #246b82; color: white;
-                                       border-radius: 4px; padding: 3px 16px; }
-            QWidget:disabled { color: #8a9299; }
-            QPushButton#connectButton:disabled { background: #d7dee5; color: #78838c; }
+            QPushButton, QLineEdit, QComboBox, QSpinBox { min-height: 28px; }
+            QToolButton { font-weight: 600; padding: 6px 2px; }
+            QPushButton#connectButton { background: #116676; color: white;
+                                       border: 1px solid #116676; border-radius: 4px;
+                                       padding: 3px 12px; font-weight: 600; }
+            QPushButton#connectButton:hover { background: #0b5664; }
+            QPushButton#disableAutomatic { background: #fff5ec; color: #8c5100;
+                border: 1px solid #bd8b55; border-radius: 4px; font-weight: 700; }
+            QPushButton#disableAutomatic:enabled:hover { background: #ffe9d3; }
+            QPushButton:focus, QLineEdit:focus, QComboBox:focus,
+            QSpinBox:focus, QCheckBox:focus, QToolButton:focus {
+                border: 2px solid #116676; }
+            QWidget:disabled { color: #59666f; }
+            QPushButton#connectButton:disabled, QPushButton#disableAutomatic:disabled {
+                background: #e9eef1; color: #59666f; border-color: #c8d2d9; }
         """)
         for label in self.findChildren(QLabel):
             label.setTextFormat(Qt.TextFormat.PlainText)
@@ -739,6 +888,168 @@ class MainWindow(QMainWindow):
 
         self.set_state("disconnected", "等待连接")
         self.set_busy(False)
+        self._update_stimulation_controls()
+        self._refresh_overview_state()
+
+    def _refresh_overview_state(self) -> None:
+        empty = (
+            not self._replay_mode and not self._busy and not self._session_finished
+            and not self._has_displayed_block
+            and self._state in {"disconnected", "error"}
+            and self.stop_warning_label.isHidden()
+        )
+        self.overview_empty.setVisible(empty)
+        self.overview_hero.setVisible(not empty)
+        self.summary_section.setVisible(not empty)
+        self.stimulation_recent_label.setVisible(not empty)
+
+    def _refresh_target_summary(self, *_args) -> None:
+        stages = [stage for stage, checkbox in self.stage_checkboxes.items() if checkbox.isChecked()]
+        self.target_summary_label.setText(
+            "目标期：" + ("、".join(stages) if stages else "未选择（默认不发送）")
+        )
+
+    def _refresh_control_summary(self) -> None:
+        if self._replay_mode:
+            self.run_control_label.setText("自动控制：回放只读 · 不发送命令")
+        elif self._rally_mode == "real":
+            self.run_control_label.setText(
+                f"自动控制：{'开' if self._p3_auto_enabled else '关'} · "
+                f"真实 Rally {self._rally_runtime_state}"
+            )
+        else:
+            self.run_control_label.setText(
+                f"自动控制：{'开' if self._p3_auto_enabled else '关'} · 本机模拟"
+            )
+        self.disable_automatic_button.setEnabled(
+            self._p3_auto_enabled and not self._replay_mode
+        )
+
+    def _refresh_recording_summary(self) -> None:
+        if self._replay_mode:
+            self.run_recording_label.setText(f"记录回放：{self._replay_completeness}")
+            self.run_recording_label.setToolTip(self.replay_status_label.text())
+            return
+        recording = self.recording_status_label.text()
+        csv = self.stage_csv_status_label.text()
+        recording_closed = "会话已关闭" in recording
+
+        def brief(text: str, selected: bool, *, is_csv: bool) -> str:
+            failed = any(word in text for word in ("失败", "错误"))
+            incomplete = any(word in text for word in ("不完整", "未完整"))
+            if failed and incomplete:
+                return "失败／不完整"
+            if failed:
+                return "失败"
+            if incomplete:
+                return "不完整"
+            if not selected:
+                return "未启用"
+            if "已选择" in text or "下次连接" in text:
+                return "已选择，待连接"
+            if is_csv and "已写入" in text:
+                return (
+                    "已写入完成" if self._session_finished or recording_closed or not self._busy
+                    else "正在写入"
+                )
+            if recording_closed or self._session_finished:
+                return "已关闭" if not is_csv else "已关闭（写入未确认）"
+            if "正在创建" in text:
+                return "初始化中"
+            if "记录中" in text or (is_csv and self._busy and self._state == "streaming"):
+                return "正在写入"
+            return "已选择，待连接"
+
+        self.run_recording_label.setText(
+            f"记录：{brief(recording, self.recording_checkbox.isChecked(), is_csv=False)} · "
+            f"CSV：{brief(csv, self.stage_csv_checkbox.isChecked(), is_csv=True)}"
+        )
+        self.run_recording_label.setToolTip(f"{recording}\n{csv}")
+
+    def _refresh_preconnect_model_summary(self, *_args) -> None:
+        if (
+            self._replay_mode or self._busy or self._session_finished
+            or self._has_displayed_block or self._state not in {"disconnected", "error"}
+        ):
+            return
+        if self.model_enabled_checkbox.isChecked():
+            detail = (
+                "ONNX 已选择，待连接校验／加载；尚无期别"
+                if self.model_path_edit.text().strip()
+                else "ONNX 已选择，文件未选；待连接校验／加载；尚无期别"
+            )
+            self.run_model_label.setText(
+                "模型：ONNX 已选择\n待连接校验／加载"
+                if self.model_path_edit.text().strip()
+                else "模型：ONNX 已选择\n文件未选 · 待连接校验"
+            )
+            self.run_model_label.setToolTip(detail)
+            self.processing_status_label.setText("分期状态：" + detail)
+            self.overview_stage_primary.setText("无期别")
+            self.overview_stage_reason.setText(detail)
+            self.overview_empty_detail.setText(
+                "ONNX 已选择，但尚未校验或加载。请先核对 Curry 地址与端口，再发起连接。"
+            )
+        else:
+            self.run_model_label.setText("模型：NoModel · 无期别")
+            self.run_model_label.setToolTip("NoModel 默认未启用；当前没有期别")
+            self.processing_status_label.setText("分期状态：模型默认未启用（NoModel）")
+            self.overview_stage_primary.setText("无期别")
+            self.overview_stage_reason.setText("模型默认未启用（NoModel）")
+            self.overview_empty_detail.setText(
+                "先核对 Curry 地址与端口，按需选择 ONNX 模型。连接后，这里显示真实的 30 秒窗口和分期结果。"
+            )
+
+    def _set_model_brief(self, result, *, recorded: bool = False) -> None:
+        if result is None:
+            if recorded:
+                self.run_model_label.setText("回放期别：未记录／处理中")
+                self.overview_stage_primary.setText("未记录")
+                self.overview_stage_reason.setText("当前回放块没有已记录的分期结果")
+            elif self.model_enabled_checkbox.isChecked() and not self._busy:
+                self._refresh_preconnect_model_summary()
+            elif self.model_enabled_checkbox.isChecked() and self._busy:
+                self.run_model_label.setText("ONNX：等待本次会话结果")
+                self.overview_stage_primary.setText("等待结果")
+                self.overview_stage_reason.setText("ONNX 已选择；校验／加载尚未完成")
+            else:
+                self.run_model_label.setText("模型：NoModel · 无期别")
+                self.overview_stage_primary.setText("无期别")
+                self.overview_stage_reason.setText("模型默认未启用（NoModel）")
+            return
+        if isinstance(result, dict):
+            status = str(result.get("status", "failed"))
+            stage = result.get("stage")
+            model = result.get("model") or {}
+            reason = result.get("reason")
+            confidence = result.get("confidence")
+        else:
+            status = result.status.value
+            stage = result.stage
+            model = result.model.to_dict()
+            reason = result.reason
+            confidence = result.confidence
+        marker = " · 测试替身" if model.get("is_test_double") else ""
+        if status == "success" and stage:
+            brief = f"最新期别：{stage}{marker}"
+            self.overview_stage_primary.setText(f"{stage}{marker}")
+            self.overview_stage_reason.setText(
+                f"置信度 {float(confidence):.3f}" if confidence is not None
+                else "模型已返回期别；置信度未提供"
+            )
+        elif status == "unavailable":
+            brief = "模型：不可用 · 无期别"
+            self.overview_stage_primary.setText("无期别")
+            self.overview_stage_reason.setText(f"模型不可用：{reason or '未接入'}")
+        elif status == "cancelled":
+            brief = "模型：分期已取消 · 无期别"
+            self.overview_stage_primary.setText("无期别")
+            self.overview_stage_reason.setText(f"分期已取消：{reason or '会话收尾'}")
+        else:
+            brief = "模型：分期失败 · 无期别（详见总览）"
+            self.overview_stage_primary.setText("无期别")
+            self.overview_stage_reason.setText(f"分期失败：{reason or '原因未知'}")
+        self.run_model_label.setText(("回放 · " if recorded else "") + brief)
 
     def configuration(self) -> dict[str, str | int | bool | None]:
         return {
@@ -873,6 +1184,7 @@ class MainWindow(QMainWindow):
         mode = str(self.rally_mode_combo.currentData() or "simulation")
         self._rally_mode = mode
         self._update_rally_mode_copy(mode)
+        self._refresh_control_summary()
         self.stimulation_auto_checkbox.setText(
             "启用真实 Rally 自动控制（需明确确认）"
             if mode == "real"
@@ -919,7 +1231,7 @@ class MainWindow(QMainWindow):
         )
 
     def _update_rally_profile_copy(self) -> None:
-        if self._rally_profile == "paradigm":
+        if self._rally_mode == "real" and self._rally_profile == "paradigm":
             self.stimulation_auto_checkbox.setText(
                 "启用范式自动控制（Start + 最新协议 Apply；需人工确认）"
             )
@@ -954,8 +1266,24 @@ class MainWindow(QMainWindow):
         )
         self._update_rally_profile_copy()
         self._update_stimulation_controls()
+        self._refresh_control_summary()
 
     def _update_rally_mode_copy(self, mode: str) -> None:
+        if self._replay_mode:
+            self.hint_label.setText(
+                "离线回放只读：不连接 Rally、不运行决策、不发送命令；"
+                "已记录的 API 回复不证明物理输出。EEG 波形请在 Curry 8 查看。"
+            )
+        elif mode == "real":
+            self.hint_label.setText(
+                "真实 Rally 控制默认关闭；需实时会话、模型、有效配置与操作者显式确认。"
+                "API 回复不证明物理输出。EEG 波形请在 Curry 8 查看。"
+            )
+        else:
+            self.hint_label.setText(
+                "本机模拟默认关闭自动控制；API 回复不证明物理输出。"
+                "EEG 波形请在 Curry 8 查看。"
+            )
         if mode == "real":
             self.stimulation_warning_label.setText(
                 "真实 Rally 模式：只控制 Rally 当前已加载协议，不选择或修改刺激参数；"
@@ -963,8 +1291,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self.stimulation_warning_label.setText(
-                "仅模拟，真实刺激未接入（当前默认状态）。真实模式只控制 Rally 已加载协议，"
-                "不选择或修改刺激参数。"
+                "本机模拟：真实 Rally 不会收到请求。真实模式只控制 Rally 已加载协议，"
+                "不选择或修改刺激参数；API 确认不等于物理输出确认。"
             )
 
     @Slot(bool)
@@ -996,14 +1324,16 @@ class MainWindow(QMainWindow):
         self.stimulation_auto_checkbox.blockSignals(False)
         self.stimulation_auto_status_label.setText(detail)
         self._update_stimulation_controls()
+        self._refresh_control_summary()
 
     @Slot(object)
     def set_rally_status(self, status: dict) -> None:
-        if not isinstance(status, dict):
+        if self._replay_mode or not isinstance(status, dict):
             return
         mode = status.get("mode", self._rally_mode)
         enabled = bool(status.get("enabled", False))
         runtime_state = status.get("runtime_state", "DISARMED/UNKNOWN")
+        self._rally_runtime_state = str(runtime_state)
         expected = status.get("expected_state") or "—"
         desired = status.get("desired_state") or "—"
         confirmed = status.get("confirmed_state") or "未知"
@@ -1057,6 +1387,43 @@ class MainWindow(QMainWindow):
         if mode == "simulation":
             detail = "Rally 控制状态：模拟模式；真实端点不会发送\n" + detail
         self.rally_control_status_label.setText(detail)
+        self.overview_control_label.setText(
+            f"控制期望：{expected} · 最新期望：{desired} · "
+            f"Rally API 最近确认：{confirmed}"
+        )
+        if profile == "paradigm":
+            self.overview_control_label.setText(
+                self.overview_control_label.text()
+                + f" · 范式期望：{desired_protocol} · API 协议确认：{confirmed_protocol}"
+            )
+        if self._replay_mode:
+            self.run_api_label.setText("Rally API：回放只读，不发送命令")
+        elif mode == "real":
+            api_command = (
+                str(last_outcome.get("command", "?")) if isinstance(last_outcome, dict)
+                else "?"
+            )
+            api_status = (
+                str(last_outcome.get("status", "?")) if isinstance(last_outcome, dict)
+                else "?"
+            )
+            self.run_api_label.setText(
+                f"API 最近确认：{confirmed} · {api_command}/{api_status}"
+                "\n物理输出未验证"
+            )
+        else:
+            self.run_api_label.setText("API 最近确认：真实端点未使用\n物理输出未验证")
+        show_warning = mode == "real" and (
+            independent or str(runtime_state).startswith("FAULT")
+            or str(runtime_state) in {"UNKNOWN", "EXPIRED/UNKNOWN"}
+        )
+        self.stop_warning_label.setText(
+            "⚠ Rally 停止未确认／状态未知：请在 Rally／硬件侧独立停止。"
+            if show_warning else ""
+        )
+        self.stop_warning_label.setVisible(show_warning)
+        self._refresh_overview_state()
+        self._refresh_control_summary()
         self._update_stimulation_controls()
 
     @Slot(bool, str)
@@ -1084,15 +1451,19 @@ class MainWindow(QMainWindow):
             editable and self._rally_mode == "real" and not self._busy
         )
         self.choose_paradigm_button.setEnabled(
-            editable and self._rally_profile == "paradigm"
+            editable and self._rally_mode == "real" and self._rally_profile == "paradigm"
         )
-        self.paradigm_package_summary_label.setVisible(self._rally_profile == "paradigm")
+        paradigm_visible = self._rally_mode == "real" and self._rally_profile == "paradigm"
+        self.profile_row_widget.setVisible(self._rally_mode == "real")
+        self.paradigm_row_widget.setVisible(paradigm_visible)
         simulation_widgets_visible = self._rally_mode == "simulation"
         self.choose_protocol_button.setVisible(simulation_widgets_visible)
         self.protocol_summary_label.setVisible(simulation_widgets_visible)
         self.simulator_start_button.setVisible(simulation_widgets_visible)
         self.simulator_stop_button.setVisible(simulation_widgets_visible)
         self.simulator_status_label.setVisible(simulation_widgets_visible)
+        self.request_timeout_edit.setVisible(simulation_widgets_visible)
+        self.request_timeout_label.setVisible(simulation_widgets_visible)
         self.rally_mode_combo.setEnabled(
             not self._p3_auto_enabled
             and not self._replay_mode
@@ -1247,6 +1618,12 @@ class MainWindow(QMainWindow):
             self.stage_csv_status_label.setText(
                 "分期 CSV：已选择；连接后写入本次新会话的 stage_labels.csv"
             )
+        if not self._busy and not self._replay_mode:
+            self.recording_status_label.setText(
+                "保存状态：已选择；下次连接创建新会话"
+                if enabled else "保存状态：未保存（记录已关闭）"
+            )
+        self._refresh_recording_summary()
 
     @Slot(bool)
     def _on_stage_csv_toggled(self, enabled: bool) -> None:
@@ -1256,14 +1633,17 @@ class MainWindow(QMainWindow):
             )
         elif not self._replay_mode:
             self.stage_csv_status_label.setText("分期 CSV：未启用")
+        self._refresh_recording_summary()
 
     @Slot(str)
     def set_recording_status(self, text: str) -> None:
         self.recording_status_label.setText("保存状态：" + text)
+        self._refresh_recording_summary()
 
     @Slot(str)
     def set_stage_csv_status(self, text: str) -> None:
         self.stage_csv_status_label.setText("分期 CSV：" + text)
+        self._refresh_recording_summary()
 
     def set_stage_csv_export_busy(self, busy: bool) -> None:
         self._stage_csv_export_busy = busy
@@ -1315,10 +1695,15 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def set_processing_result(self, result) -> None:
+        if self._replay_mode or self._session_finished:
+            return
         self.processing_status_label.setText(self._format_processing_result(result))
+        self._set_model_brief(result)
 
     @Slot(str, str)
     def set_state(self, state: str, detail: str) -> None:
+        if self._replay_mode:
+            return
         labels = {
             "disconnected": "未连接",
             "connecting": "连接中",
@@ -1329,9 +1714,21 @@ class MainWindow(QMainWindow):
         self._state = state
         state_text = labels.get(state, state)
         self.state_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.state_label.setText(f"状态：{state_text} · {detail}")
-        self.status_summary.setText(f"{state_text} · {detail}")
+        self.state_label.setText(f"连接：{state_text}")
+        self.state_label.setToolTip(f"{state_text} · {detail}")
+        self.status_summary.setText(state_text)
         self.statusBar().showMessage(f"{state_text} · {detail}")
+        self.statusBar().setToolTip(f"{state_text} · {detail}")
+        self._refresh_recording_summary()
+        self._refresh_overview_state()
+        if state == "connecting" and not self._handshake_ready and not self._replay_mode:
+            self.run_progress_label.setText("30 秒窗口：等待 Curry 握手")
+            self.overview_progress_primary.setText("等待握手")
+            self.overview_progress_detail.setText("尚未收到合法网络包")
+        elif state == "streaming" and self._handshake_ready and self._last_assembly_snapshot is None:
+            self.run_progress_label.setText("30 秒窗口：已握手 · 0.0 / 30 秒")
+            self.overview_progress_primary.setText("0.0 / 30 秒")
+            self.overview_progress_detail.setText("已握手；等待采样点累积")
         if not self._replay_mode and not self._session_finished and not self._has_displayed_block:
             if state == "connecting" and not self._handshake_ready:
                 self.data_status_label.setText(
@@ -1367,6 +1764,8 @@ class MainWindow(QMainWindow):
             self.recording_checkbox.isChecked() and not busy and not self._replay_mode
         )
         self.choose_recording_dir_button.setEnabled(not busy and not self._replay_mode)
+        self._refresh_recording_summary()
+        self._refresh_overview_state()
         self._update_button_state()
         self._maybe_finish_pending_close()
 
@@ -1424,6 +1823,7 @@ class MainWindow(QMainWindow):
         self._update_stimulation_controls()
 
         if entering:
+            self._replay_completeness = "加载中"
             self._replay_overview_ready = False
             self._stage_csv_export_busy = False
             self.mode_label.setText("离线回放 · 加载中")
@@ -1444,7 +1844,16 @@ class MainWindow(QMainWindow):
             self.assembly_progress_label.setText("接收进度：离线回放不显示实时累积进度")
             self.data_status_label.setText("数据状态：正在打开离线回放")
             self.processing_status_label.setText("离线回放：等待已记录分期结果")
+            self.run_progress_label.setText("30 秒窗口：离线回放，无实时累积")
+            self.run_model_label.setText("回放期别：等待已记录结果")
+            self.overview_progress_primary.setText("只读回放")
+            self.overview_progress_detail.setText("不显示实时 30 秒累积")
+            self.overview_stage_primary.setText("等待记录")
+            self.overview_stage_reason.setText("只展示会话中已保存的分期结果")
+            self.run_api_label.setText("Rally API：回放只读，不发送命令")
+            self.overview_control_label.setText("回放控制：仅展示已记录事件，不发送命令")
         if not active:
+            self._replay_completeness = "未打开"
             self._replay_overview_ready = False
             self._handshake_ready = False
             self.mode_label.setText("历史离线回放" if self._has_displayed_block else "实时 · 未连接")
@@ -1463,10 +1872,28 @@ class MainWindow(QMainWindow):
                 self.assembly_progress_label.setText(
                     "接收进度：尚未连接；当前累计 0.0 / 30 秒"
                 )
+            self.run_progress_label.setText("30 秒窗口：未连接 · 0.0 / 30 秒")
+            self.overview_progress_primary.setText("等待连接")
+            self.overview_progress_detail.setText("0.0 / 30 秒；尚无实时窗口")
+            self.run_model_label.setText(
+                "历史回放已退出 · 无实时期别"
+                if self._has_displayed_block else "模型：NoModel · 无期别"
+            )
+            if self._has_displayed_block:
+                self.overview_stage_primary.setText("无实时期别")
+                self.overview_stage_reason.setText("历史回放已退出")
+            self.run_api_label.setText("API 最近确认：无\n物理输出未验证")
+            self.overview_control_label.setText("控制期望：无 · Rally API 最近确认：未知")
         elif message:
             self.replay_status_label.setText(message)
         self._update_button_state()
         self._update_stimulation_controls()
+        self._update_rally_mode_copy(self._rally_mode)
+        self._refresh_control_summary()
+        self._refresh_recording_summary()
+        self._refresh_overview_state()
+        if not active:
+            self._refresh_preconnect_model_summary()
 
     @Slot()
     def _update_model_controls(self) -> None:
@@ -1478,11 +1905,17 @@ class MainWindow(QMainWindow):
         self.model_path_edit.setEnabled(enabled)
         self.choose_model_button.setEnabled(enabled)
         self.model_channel_edit.setEnabled(enabled)
+        self._refresh_preconnect_model_summary()
 
     def set_replay_ready(self, overview) -> None:
         self._replay_overview_ready = True
+        self._replay_completeness = "不完整" if overview.incomplete else "完整"
         self.session_id_label.setText(f"回放会话：{overview.session_id}")
         self._replay_block_count = overview.block_count
+        self.overview_progress_detail.setText(
+            f"{overview.block_count} 个已记录块 · "
+            f"{'不完整' if overview.incomplete else '完整'}；无实时累积"
+        )
         if not overview.block_count:
             self.clear_block_summary("空会话：0 个已记录块")
         self.replay_index_spin.blockSignals(True)
@@ -1504,6 +1937,7 @@ class MainWindow(QMainWindow):
         self.status_summary.setText("离线回放")
         self.statusBar().showMessage(detail)
         self._update_button_state()
+        self._refresh_recording_summary()
 
     def show_replay_block(self, block: DataBlock, entry, index: int, total: int) -> None:
         self.replay_index_spin.blockSignals(True)
@@ -1549,6 +1983,16 @@ class MainWindow(QMainWindow):
         if not isinstance(snapshot, EpochAssemblySnapshot):
             return
         self._last_assembly_snapshot = snapshot
+        self.overview_progress_primary.setText(
+            f"{snapshot.pending_seconds:.1f} / {snapshot.window_seconds:g} 秒"
+        )
+        self.overview_progress_detail.setText(
+            f"完整 {snapshot.completed_windows} 块 · 已收 {snapshot.received_samples} 点"
+        )
+        self.run_progress_label.setText(
+            f"30 秒窗口：{snapshot.pending_seconds:.1f} / {snapshot.window_seconds:g} 秒"
+            f" · 完整 {snapshot.completed_windows} 块"
+        )
         self.assembly_progress_label.setText(
             f"接收进度：收包 {snapshot.received_packets} 个 · "
             f"样本 {snapshot.received_samples} 点 · "
@@ -1563,12 +2007,18 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def set_session(self, session: SessionInfo | None) -> None:
+        if self._replay_mode:
+            return
         if session is None:
             self._handshake_ready = False
             self.session_info.setPlainText("尚未完成 BasicInfo / ChannelInfo 握手")
             self.available_model_channels_label.setText("完成 Curry 握手后显示可用通道")
             return
         self._handshake_ready = True
+        if not self._replay_mode and self._last_assembly_snapshot is None:
+            self.run_progress_label.setText("30 秒窗口：已握手 · 0.0 / 30 秒")
+            self.overview_progress_primary.setText("0.0 / 30 秒")
+            self.overview_progress_detail.setText("已握手；等待采样点累积")
         self.available_model_channels_label.setText(", ".join(session.labels))
         text = (
             f"EEG 通道数：{session.n_channels}\n"
@@ -1590,8 +2040,22 @@ class MainWindow(QMainWindow):
         self._session_finished = False
         self._last_assembly_snapshot = None
         self._handshake_ready = False
+        self.recording_status_label.setText(
+            "保存状态：正在创建新会话目录"
+            if self.recording_checkbox.isChecked() else "保存状态：未保存（记录已关闭）"
+        )
+        self.stage_csv_status_label.setText(
+            "分期 CSV：正在创建本次会话文件"
+            if self.stage_csv_checkbox.isChecked() else "分期 CSV：未启用"
+        )
+        self._refresh_recording_summary()
         self.mode_label.setText("实时 · 正在连接")
+        self.run_progress_label.setText("30 秒窗口：等待 Curry 握手")
+        self.run_model_label.setText("模型：等待本次会话结果")
+        self.overview_progress_primary.setText("等待握手")
+        self.overview_progress_detail.setText("尚未收到合法网络包")
         self.clear_block_summary("正在连接 Curry，等待 BasicInfo / ChannelInfo 握手")
+        self._refresh_overview_state()
         self.assembly_progress_label.setText(
             "接收进度：正在连接/等待握手；尚未收到合法网络包"
         )
@@ -1630,6 +2094,14 @@ class MainWindow(QMainWindow):
             f"block_id={block_number} · 样本区间 [{block.start_sample}, {block.start_sample + n_samples})\n"
             "标签：" + ", ".join(block.labels) + " · 原始值（单位未确认）"
         )
+        if not self._replay_mode:
+            if self._last_assembly_snapshot is None:
+                self.run_progress_label.setText(
+                    f"30 秒窗口：最新完整块 #{block_number} · {duration:.1f} 秒"
+                )
+                self.overview_progress_primary.setText(f"完整块 #{block_number}")
+                self.overview_progress_detail.setText("下一窗口累积进度尚未收到")
+        self._refresh_overview_state()
         self._last_display_note = "界面仅更新块摘要；完整 EEG 仍用于处理及可选保存。"
         if replaced_count:
             self._last_display_note += (
@@ -1644,6 +2116,9 @@ class MainWindow(QMainWindow):
         self.data_status_label.setText("数据状态：" + reason)
         self.block_metadata_label.setText("尚无有效数据块")
         self.processing_status_label.setText("分期状态：等待该块结果")
+        self.run_model_label.setText("模型：等待该块结果 · 无期别")
+        self.overview_stage_primary.setText("等待结果")
+        self.overview_stage_reason.setText(reason)
         self._p3_replay_events = ()
         self._p3_recent.clear()
         self.stimulation_recent_label.setText("当前块尚无可显示的刺激事件")
@@ -1657,11 +2132,17 @@ class MainWindow(QMainWindow):
             self.processing_status_label.setText(
                 "离线回放 · " + self._format_processing_result(result).removeprefix("分期状态：")
             )
+        self._set_model_brief(result, recorded=True)
 
     @Slot(bool, object)
     def mark_session_finished(self, cancelled: bool, error: BaseException | None) -> None:
         self._session_finished = True
+        self._refresh_recording_summary()
         self.mode_label.setText("历史 · 会话已结束")
+        self.run_progress_label.setText("30 秒窗口：会话已结束 · 无实时累积")
+        self.overview_progress_primary.setText("会话已结束")
+        self.overview_progress_detail.setText("无实时累积；上方状态为历史结果")
+        self._refresh_overview_state()
         if self._last_assembly_snapshot is not None:
             snapshot = self._last_assembly_snapshot
             tail = (

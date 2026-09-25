@@ -1,10 +1,12 @@
 # 当前任务队列
 
-更新：2026-09-24。当前角色：决策主线程。
+更新：2026-09-25。当前角色：决策主线程。
 
 ## 当前目标与状态
 
-2026-09-24 当前权威状态：P4-B 已通过 PR #4 合并；Issue 5 与 Issue 6 工程范围通过验收并发布于 `main@cf88643`；Issue 7 工程范围通过验收并发布于 `main@98c4100`；Issue 8 工程范围通过验收并发布于 `main@72bd2ef`。远端 Issue #5–#8 均以 completed 关闭。以下早期“未提交/待实现”等叙述是当时的历史状态。
+2026-09-25 当前权威状态：P4-B 已通过 PR #4 合并；Issue 5 与 Issue 6 工程范围通过验收并发布于 `main@cf88643`；Issue 7 工程范围通过验收并发布于 `main@98c4100`；Issue 8 工程范围通过验收并发布于 `main@72bd2ef`。远端 Issue #5–#8 均以 completed 关闭。现代化 GUI 已在 `feature/modern-control-ui` 完成收口并通过主线程工程验收；尚未提交推送或合并，Windows 原生界面仍待验证。以下早期“未提交/待实现”等叙述是当时的历史状态。
+
+- [现代化 GUI 调研与设计](../docs/P_GUI_MODERNIZATION_DESIGN.md)、[实施计划](plans/P_GUI_MODERNIZATION_PLAN.md)及[执行任务](../docs/tasks/P_GUI_MODERNIZATION_EXECUTION.md)已在 `feature/modern-control-ui` 完成实现与[收口任务](../docs/tasks/P_GUI_MODERNIZATION_CLOSEOUT.md)；[主线程验收记录末节](../reports/P_GUI_MODERNIZATION_ACCEPTANCE.md)判定工程范围通过，首次暂不通过为历史。执行者最终定向 61 passed、完整回归 254 passed；主线程仅复现两项关键状态，未重跑全量。改动未提交、推送或合并；Windows 原生鼠标／缩放／高对比度及真机未验证。
 
 - 远端 [Issue #5](https://github.com/GTOING/curry8-netstream/issues/5) 与 [Issue #6](https://github.com/GTOING/curry8-netstream/issues/6) 已于 2026-09-24 以 completed 关闭；获取时均无评论，原始状态归档见 [Issue 快照](../reports/remote_issues/2026-09-22/issue-5.md) 及 [#6](../reports/remote_issues/2026-09-22/issue-6.md)。
 - 远端 [Issue #7：会话分期 CSV 自动续写与本机时间](https://github.com/GTOING/curry8-netstream/issues/7) 已于 2026-09-24 以 completed 关闭；两项收口通过[主线程工程验收](../reports/ISSUE7_SESSION_CSV_ACCEPTANCE.md)，实现与证据已提交推送。执行者最终定向 5 passed、完整回归 246 passed；主线程未重跑全量。Windows/Excel 与真实设备验证未执行；CSV 是会话 JSONL/NPY 的可选派生表，本机接收时间不代表 EEG 精确采集时刻。
